@@ -1,0 +1,29 @@
+# Swift build artifacts
+.build/
+.swiftpm/
+src/capture/local-speech-capture
+src/capture/.build/
+*.xcodeproj/
+DerivedData/
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Local config / data (never commit)
+.local-speech/
+*.wav
+*.bin
+*.npy
+
+# Logs
+*.log
+
+# OS / temp
+*~
+.~lock.*

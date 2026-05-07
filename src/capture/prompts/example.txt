@@ -1,0 +1,10 @@
+// Example custom prompt: list names, jargon, and acronyms whisper might mishear.
+// Copy this file to ~/.local-speech/prompts/default.txt and edit to your needs.
+//
+// Tips:
+// - Comma-separated list of proper nouns
+// - Include acronyms with their expansions
+// - Keep it under 200 tokens
+
+Alice, Bob, Charlie, San Francisco, OpenAI, Anthropic.
+SaaS, B2B, KPI, MRR, ARR.

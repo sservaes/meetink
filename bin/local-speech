@@ -1,0 +1,354 @@
+#!/bin/zsh
+# local-speech — local-first meeting transcription for macOS
+# https://github.com/sservaes/local-speech
+
+set -e
+
+# --- Locate self ---
+SCRIPT_PATH="${0:A}"
+LS_BIN_DIR="${SCRIPT_PATH:h}"
+LS_ROOT="${LS_BIN_DIR:h}"
+
+# --- Config ---
+LOCAL_SPEECH_VERSION="0.1.0"
+LS_HOME="${LOCAL_SPEECH_HOME:-$HOME/.local-speech}"
+LS_MODEL="${LOCAL_SPEECH_MODEL:-$LS_HOME/models/ggml-small.en.bin}"
+LS_TRANSCRIPT="${LOCAL_SPEECH_TRANSCRIPT:-$LS_HOME/transcripts/live.txt}"
+LS_PROMPT="${LOCAL_SPEECH_PROMPT:-$LS_HOME/prompts/default.txt}"
+LS_PORT=8178
+
+PID_FILE="/tmp/local-speech-capture.pid"
+SERVER_PID_FILE="/tmp/local-speech-whisper.pid"
+
+# --- UI helpers ---
+source "$LS_ROOT/src/lib/ui.sh"
+source "$LS_ROOT/src/lib/welcome.sh"
+
+# --- Locate the Swift binary (preferred location: $LS_HOME/bin) ---
+find_capture_binary() {
+    local candidates=(
+        "$LS_HOME/bin/local-speech-capture"
+        "$LS_ROOT/src/capture/local-speech-capture"
+        "$LS_ROOT/.build/release/local-speech-capture"
+    )
+    for c in $candidates; do
+        if [[ -x "$c" ]]; then
+            echo "$c"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# --- Locate a usable macOS SDK (prefers 15.x to avoid SDK/toolchain mismatches) ---
+find_sdk() {
+    local sdk_root="/Library/Developer/CommandLineTools/SDKs"
+    # Prefer 15.x SDKs (most stable with current Swift CLI)
+    for v in 15.5 15.4 15 14.5 14; do
+        if [[ -d "$sdk_root/MacOSX${v}.sdk" ]]; then
+            echo "$sdk_root/MacOSX${v}.sdk"
+            return 0
+        fi
+    done
+    # Fall back to default
+    if [[ -d "$sdk_root/MacOSX.sdk" ]]; then
+        echo "$sdk_root/MacOSX.sdk"
+        return 0
+    fi
+    return 1
+}
+
+# --- Build Swift binary ---
+build_capture() {
+    print -P "${C[bright_yellow]}▸${C[reset]} Building capture binary..."
+    cd "$LS_ROOT/src/capture"
+    if ! command -v swiftc >/dev/null 2>&1; then
+        print -P "${C[red]}error:${C[reset]} ${C[bold]}swiftc${C[reset]} not found"
+        print -P "  Install Xcode Command Line Tools:"
+        print -P "  ${C[bright_cyan]}xcode-select --install${C[reset]}"
+        exit 1
+    fi
+
+    local sdk
+    if ! sdk=$(find_sdk); then
+        print -P "${C[red]}error:${C[reset]} no macOS SDK found in /Library/Developer/CommandLineTools/SDKs/"
+        print -P "  Reinstall command-line tools: ${C[bright_cyan]}xcode-select --install${C[reset]}"
+        exit 1
+    fi
+    print -P "  ${C[dim]}using SDK: ${sdk}${C[reset]}"
+
+    swiftc -O -o local-speech-capture Sources/main.swift \
+        -framework ScreenCaptureKit -framework AVFoundation \
+        -framework CoreMedia -framework CoreAudio \
+        -parse-as-library \
+        -sdk "$sdk" \
+        -target arm64-apple-macosx14.0 || {
+            print -P "${C[red]}error:${C[reset]} build failed"
+            exit 1
+        }
+    mkdir -p "$LS_HOME/bin"
+    cp local-speech-capture "$LS_HOME/bin/local-speech-capture"
+    print -P "${C[green]}✓${C[reset]} Built: ${C[dim]}$LS_HOME/bin/local-speech-capture${C[reset]}"
+    cd - > /dev/null
+}
+
+# --- Download whisper model ---
+download_model() {
+    local model_name="${1:-small.en}"
+    local target="$LS_HOME/models/ggml-${model_name}.bin"
+    local url="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-${model_name}.bin"
+
+    if [[ -f "$target" ]]; then
+        print -P "${C[green]}✓${C[reset]} Model already present: ${C[dim]}$target${C[reset]}"
+        return 0
+    fi
+
+    print -P "${C[bright_yellow]}▸${C[reset]} Downloading whisper model (${model_name}, ~500 MB)..."
+    mkdir -p "$LS_HOME/models"
+    if ! curl -L --fail --progress-bar -o "$target" "$url"; then
+        print -P "${C[red]}error:${C[reset]} download failed"
+        rm -f "$target"
+        exit 1
+    fi
+    print -P "${C[green]}✓${C[reset]} Model downloaded: ${C[dim]}$target${C[reset]}"
+}
+
+# --- Install whisper.cpp via brew ---
+install_whisper() {
+    if command -v whisper-server >/dev/null 2>&1; then
+        print -P "${C[green]}✓${C[reset]} whisper-cpp already installed"
+        return 0
+    fi
+    print -P "${C[bright_yellow]}▸${C[reset]} Installing whisper.cpp..."
+    if ! command -v brew >/dev/null 2>&1; then
+        print -P "${C[red]}error:${C[reset]} Homebrew not found"
+        print -P "  Install from ${C[bright_cyan]}https://brew.sh${C[reset]}"
+        exit 1
+    fi
+    brew install whisper-cpp
+    print -P "${C[green]}✓${C[reset]} whisper-cpp installed"
+}
+
+# --- Setup wizard ---
+cmd_setup() {
+    print -P ""
+    print -P "${C[bold]}local·speech setup${C[reset]}"
+    print -P "${C[dim]}This will install dependencies and download the whisper model.${C[reset]}"
+    print -P ""
+
+    mkdir -p "$LS_HOME"/{bin,models,transcripts,prompts}
+
+    # Copy default prompt if missing
+    if [[ ! -f "$LS_PROMPT" ]] && [[ -f "$LS_ROOT/src/capture/prompts/default.txt" ]]; then
+        cp "$LS_ROOT/src/capture/prompts/default.txt" "$LS_PROMPT"
+        print -P "${C[green]}✓${C[reset]} Default prompt installed: ${C[dim]}$LS_PROMPT${C[reset]}"
+    fi
+
+    # 1. whisper.cpp
+    install_whisper
+
+    # 2. Build Swift binary
+    if ! find_capture_binary >/dev/null 2>&1; then
+        build_capture
+    else
+        print -P "${C[green]}✓${C[reset]} Capture binary present"
+    fi
+
+    # 3. Whisper model
+    download_model "small.en"
+
+    print -P ""
+    print -P "${C[green]}${C[bold]}Setup complete.${C[reset]}"
+    print -P ""
+    print -P "  Next steps:"
+    print -P "  ${C[dim]}1.${C[reset]} Grant ${C[bold]}Screen & System Audio Recording${C[reset]} permission to your terminal"
+    print -P "     ${C[dim]}System Settings → Privacy & Security → Screen & System Audio Recording${C[reset]}"
+    print -P "  ${C[dim]}2.${C[reset]} Grant ${C[bold]}Microphone${C[reset]} permission to your terminal"
+    print -P "  ${C[dim]}3.${C[reset]} Run ${C[bright_cyan]}local-speech start${C[reset]}"
+    print -P ""
+}
+
+# --- Start whisper-server in background ---
+start_whisper_server() {
+    if [[ -f "$SERVER_PID_FILE" ]] && kill -0 "$(cat "$SERVER_PID_FILE")" 2>/dev/null; then
+        print -P "${C[dim]}whisper-server already running${C[reset]}"
+        return 0
+    fi
+    if ! command -v whisper-server >/dev/null 2>&1; then
+        print -P "${C[red]}error:${C[reset]} whisper-server not found. Run ${C[bright_cyan]}local-speech setup${C[reset]}"
+        exit 1
+    fi
+    if [[ ! -f "$LS_MODEL" ]]; then
+        print -P "${C[red]}error:${C[reset]} model not found at $LS_MODEL"
+        print -P "  Run ${C[bright_cyan]}local-speech setup${C[reset]} to download it"
+        exit 1
+    fi
+
+    print -P "${C[dim]}Starting whisper-server (port $LS_PORT)...${C[reset]}"
+    whisper-server \
+        -m "$LS_MODEL" \
+        --port "$LS_PORT" \
+        --host 127.0.0.1 \
+        -t 4 \
+        -l en \
+        > /tmp/local-speech-whisper.log 2>&1 &
+    echo $! > "$SERVER_PID_FILE"
+
+    for i in {1..30}; do
+        if curl -s -o /dev/null "http://127.0.0.1:$LS_PORT/" 2>/dev/null; then
+            print -P "${C[green]}✓${C[reset]} whisper-server ready"
+            return 0
+        fi
+        sleep 1
+    done
+    print -P "${C[red]}error:${C[reset]} whisper-server failed to start. Check /tmp/local-speech-whisper.log"
+    exit 1
+}
+
+# --- Stop whisper-server ---
+stop_whisper_server() {
+    if [[ -f "$SERVER_PID_FILE" ]]; then
+        local sp=$(cat "$SERVER_PID_FILE")
+        if kill -0 "$sp" 2>/dev/null; then
+            kill "$sp"
+        fi
+        rm -f "$SERVER_PID_FILE"
+    fi
+}
+
+# --- Start command ---
+cmd_start() {
+    if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        print -P "${C[yellow]}Already recording${C[reset]} (PID $(cat "$PID_FILE"))"
+        print -P "  Transcript: ${C[dim]}$LS_TRANSCRIPT${C[reset]}"
+        exit 1
+    fi
+
+    local binary
+    if ! binary=$(find_capture_binary); then
+        print -P "${C[yellow]}Capture binary not found. Building...${C[reset]}"
+        build_capture
+        binary=$(find_capture_binary) || { print -P "${C[red]}error:${C[reset]} build did not produce a binary"; exit 1 }
+    fi
+
+    mkdir -p "$LS_HOME"/{transcripts,prompts}
+
+    start_whisper_server
+
+    LOCAL_SPEECH_MODEL="$LS_MODEL" \
+    LOCAL_SPEECH_TRANSCRIPT="$LS_TRANSCRIPT" \
+    LOCAL_SPEECH_PROMPT="$LS_PROMPT" \
+        "$binary" 2>/tmp/local-speech-capture.log &
+    echo $! > "$PID_FILE"
+
+    print -P ""
+    print -P "${C[green]}${C[bold]}● Recording started${C[reset]}  (PID $(cat "$PID_FILE"))"
+    print -P "  Transcript: ${C[bright_cyan]}$LS_TRANSCRIPT${C[reset]}"
+    print -P "  Stop with: ${C[bright_cyan]}local-speech stop${C[reset]}"
+    print -P "  Follow live: ${C[bright_cyan]}local-speech tail${C[reset]}"
+    print -P ""
+}
+
+# --- Stop command ---
+cmd_stop() {
+    if [[ ! -f "$PID_FILE" ]]; then
+        print -P "${C[dim]}Not recording.${C[reset]}"
+        exit 0
+    fi
+    local pid=$(cat "$PID_FILE")
+    if kill -0 "$pid" 2>/dev/null; then
+        print -P "${C[dim]}Stopping recording...${C[reset]}"
+        kill -INT "$pid"
+        for i in {1..30}; do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -9 "$pid"
+        fi
+    fi
+    rm -f "$PID_FILE"
+    stop_whisper_server
+
+    print -P "${C[green]}✓${C[reset]} Stopped."
+    if [[ -f "$LS_TRANSCRIPT" ]]; then
+        local lines=$(wc -l < "$LS_TRANSCRIPT" | tr -d ' ')
+        print -P "  Transcript: ${C[bright_cyan]}$LS_TRANSCRIPT${C[reset]} ${C[dim]}($lines lines)${C[reset]}"
+    fi
+}
+
+# --- Status command ---
+cmd_status() {
+    if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        local pid=$(cat "$PID_FILE")
+        local lines=0
+        [[ -f "$LS_TRANSCRIPT" ]] && lines=$(wc -l < "$LS_TRANSCRIPT" | tr -d ' ')
+        print -P "${C[green]}● recording${C[reset]} (PID $pid)"
+        print -P "  Transcript: ${C[dim]}$LS_TRANSCRIPT${C[reset]} ${C[dim]}($lines lines)${C[reset]}"
+    else
+        rm -f "$PID_FILE" 2>/dev/null
+        print -P "${C[dim]}○ not recording${C[reset]}"
+        if [[ -f "$LS_TRANSCRIPT" ]]; then
+            print -P "  Last transcript: ${C[dim]}$LS_TRANSCRIPT${C[reset]}"
+        fi
+    fi
+}
+
+# --- Tail command ---
+cmd_tail() {
+    if [[ ! -f "$LS_TRANSCRIPT" ]]; then
+        print -P "${C[red]}error:${C[reset]} no transcript at $LS_TRANSCRIPT"
+        exit 1
+    fi
+    print -P "${C[dim]}Following $LS_TRANSCRIPT (Ctrl+C to stop)${C[reset]}"
+    print -P ""
+    tail -f "$LS_TRANSCRIPT"
+}
+
+# --- Help ---
+cmd_help() {
+    print -P ""
+    print -P "${C[bold]}local-speech${C[reset]} ${C[dim]}v${LOCAL_SPEECH_VERSION}${C[reset]} — local-first meeting transcription"
+    print -P ""
+    print -P "${C[bright_yellow]}USAGE${C[reset]}"
+    print -P "  local-speech [command]"
+    print -P ""
+    print -P "${C[bright_yellow]}COMMANDS${C[reset]}"
+    bullet "setup    " "install dependencies + download model"
+    bullet "start    " "begin transcribing system audio + microphone"
+    bullet "stop     " "stop recording, save transcript"
+    bullet "status   " "show whether recording is active"
+    bullet "tail     " "follow the live transcript"
+    bullet "help     " "show this help"
+    print -P ""
+    print -P "${C[bright_yellow]}OUTPUT${C[reset]}"
+    print -P "  Transcripts:  ${C[dim]}$LS_HOME/transcripts/live.txt${C[reset]}"
+    print -P "  Prompts:      ${C[dim]}$LS_HOME/prompts/default.txt${C[reset]} ${C[dim]}(edit to customize whisper context)${C[reset]}"
+    print -P "  Models:       ${C[dim]}$LS_HOME/models/${C[reset]}"
+    print -P ""
+    print -P "${C[bright_yellow]}ENV OVERRIDES${C[reset]}"
+    print -P "  ${C[dim]}LOCAL_SPEECH_HOME${C[reset]}        custom data directory"
+    print -P "  ${C[dim]}LOCAL_SPEECH_MODEL${C[reset]}       custom whisper model path"
+    print -P "  ${C[dim]}LOCAL_SPEECH_TRANSCRIPT${C[reset]}  custom transcript path"
+    print -P "  ${C[dim]}LOCAL_SPEECH_PROMPT${C[reset]}      custom prompt path"
+    print -P ""
+    print -P "${C[dim]}https://github.com/sservaes/local-speech${C[reset]}"
+    print -P ""
+}
+
+# --- Dispatch ---
+case "${1:-welcome}" in
+    welcome|"")        welcome_screen ;;
+    setup)             cmd_setup ;;
+    start)             shift; cmd_start "$@" ;;
+    stop)              cmd_stop ;;
+    status)            cmd_status ;;
+    tail|follow)       cmd_tail ;;
+    help|--help|-h)    cmd_help ;;
+    version|--version|-v) print "local-speech v$LOCAL_SPEECH_VERSION" ;;
+    *)
+        print -P "${C[red]}unknown command:${C[reset]} $1"
+        print -P "Run ${C[bright_cyan]}local-speech help${C[reset]} for available commands."
+        exit 1
+        ;;
+esac
