@@ -747,7 +747,7 @@ def bottom_toolbar():
 SLASH_COMMANDS = [
     "/start", "/stop", "/status", "/tail", "/prompt", "/transcripts",
     "/model", "/llm", "/diarize", "/profile", "/project", "/me", "/ask",
-    "/context", "/index", "/setup", "/clear", "/help", "/quit",
+    "/context", "/index", "/watch", "/setup", "/clear", "/help", "/quit",
 ]
 
 
@@ -914,6 +914,15 @@ _NESTED_COMMANDS = {
         "install": None,
         "rm": None,
     },
+    "/watch": {
+        "events": None,
+        "notify": None,
+        "detect": None,
+        "on": None,
+        "off": None,
+        "status": None,
+        "help": None,
+    },
 }
 
 
@@ -937,6 +946,7 @@ HELP_TEXT = """\033[93mCOMMANDS\033[0m
   \033[1m/ask\033[0m           \033[2mask the AI about the current/latest transcript: /ask what did we decide?\033[0m
   \033[1m/context\033[0m       \033[2mattach docs to a project: /context add report.pdf | list | rm | show\033[0m
   \033[1m/index\033[0m         \033[2mRAG sidecar for /ask on long meetings: /index install | status | rm\033[0m
+  \033[1m/watch\033[0m         \033[2mauto-record from calendar (phase 1: /watch events | notify | detect)\033[0m
   \033[1m/setup\033[0m        \033[2minstall dependencies + download whisper model\033[0m
   \033[1m/clear\033[0m        \033[2mclear scrollback\033[0m
   \033[1m/help\033[0m         \033[2mthis list\033[0m

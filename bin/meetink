@@ -45,6 +45,7 @@ source "$MK_ROOT/src/lib/ask.sh"
 source "$MK_ROOT/src/lib/summary.sh"
 source "$MK_ROOT/src/lib/context.sh"
 source "$MK_ROOT/src/lib/index.sh"
+source "$MK_ROOT/src/lib/watch.sh"
 source "$MK_ROOT/src/lib/repl.sh"
 
 # If an active project is configured, redirect $MK_TRANSCRIPTS_DIR /
@@ -742,6 +743,8 @@ case "${1:-}" in
     ask)               shift; cmd_ask "$@" ;;
     context)           shift; cmd_context "$@" ;;
     index)             shift; cmd_index "$@" ;;
+    watch)             shift; cmd_watch "$@" ;;
+    _build_agent)      build_agent ;;
     prompt|vocab)
         mkdir -p "${MK_PROMPT:h}"
         [[ -f "$MK_PROMPT" ]] || touch "$MK_PROMPT"

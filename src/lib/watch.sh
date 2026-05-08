@@ -1,0 +1,176 @@
+#!/bin/zsh
+# /watch — auto-record meetings from your calendar.
+#
+# This file ships in two phases. Today (phase 1) it exposes diagnostic
+# subcommands that wrap the meetink-agent app bundle so you can validate
+# calendar access, notifications, and meeting detection without leaving
+# the REPL:
+#
+#   /watch events    list upcoming events from Calendar.app
+#   /watch notify    send a test notification with action buttons
+#   /watch detect    show whether a video call is currently active
+#
+# Phase 2 (later) adds the long-running watcher:
+#
+#   /watch on        start the watcher; auto-records meetings until
+#                    /watch off
+#   /watch off       stop the watcher (does not stop an in-flight
+#                    recording)
+#   /watch status    state of the watcher + next event ETA
+#
+# Sourced by bin/meetink AFTER index.sh, repl.sh.
+
+MK_AGENT="$MK_HOME/bin/MeetinkAgent.app/Contents/MacOS/meetink-agent"
+
+
+# Resolve the agent binary, fail with a friendly hint if missing.
+_watch_agent_path() {
+    if [[ ! -x "$MK_AGENT" ]]; then
+        print -P "${C[red]}error:${C[reset]} ${C[bold]}meetink-agent${C[reset]} not built"
+        print -P "  Run ${C[bright_cyan]}meetink setup${C[reset]} ${C[dim]}or${C[reset]} ${C[bright_cyan]}meetink _build_agent${C[reset]} to build the app bundle."
+        return 1
+    fi
+    print -n -- "$MK_AGENT"
+}
+
+
+# /watch events [--hours N] — pretty-prints upcoming calendar events.
+# First run triggers macOS Full Calendar Access prompt; grant via
+# System Settings → Privacy & Security → Calendar.
+watch_events() {
+    local agent
+    agent=$(_watch_agent_path) || return 1
+    local hours="${1:-8}"
+    if ! [[ "$hours" =~ ^[0-9]+$ ]]; then
+        print -P "${C[red]}usage:${C[reset]} /watch events [hours]"
+        return 1
+    fi
+
+    print -P ""
+    print -P "${C[bright_yellow]}UPCOMING EVENTS${C[reset]} ${C[dim]}(next ${hours}h)${C[reset]}"
+    print -P ""
+
+    # The agent prints a JSON array on stdout. We pipe through Python to
+    # render one event per line, with start time, RSVP status, and title.
+    # All-day events are already filtered out by the agent.
+    local out
+    out=$("$agent" events --hours "$hours" 2>&1)
+    local rc=$?
+    if (( rc != 0 )); then
+        print -P "${C[red]}agent error:${C[reset]} $out"
+        if [[ "$out" == *"Calendar access denied"* ]]; then
+            print -P "  ${C[dim]}Grant access via${C[reset]} ${C[bright_cyan]}System Settings → Privacy & Security → Calendar${C[reset]}"
+        fi
+        return 1
+    fi
+
+    "$MK_PY_VENV/bin/python" - "$out" <<'PY' 2>/dev/null || print -P "${C[red]}error:${C[reset]} couldn't parse agent output"
+import sys, json
+data = json.loads(sys.argv[1])
+if not data:
+    print("  (none)")
+    sys.exit(0)
+RSVP_COLOUR = {
+    "accepted":  "\033[32m",
+    "declined":  "\033[31m",
+    "tentative": "\033[33m",
+    "pending":   "\033[33m",
+    "none":      "\033[90m",
+}
+for e in data:
+    start = e["start"][11:16]   # HH:MM
+    end   = e["end"][11:16]
+    rsvp  = e["rsvpStatus"]
+    col   = RSVP_COLOUR.get(rsvp, "\033[90m")
+    title = e["title"]
+    n_att = len(e.get("attendees", []))
+    cal   = e.get("calendarTitle", "")
+    cal_label = f" \033[90m· {cal}\033[0m" if cal else ""
+    att_label = f" \033[90m· {n_att} attendees\033[0m" if n_att else ""
+    print(f"  \033[2m{start}\033[0m–\033[2m{end}\033[0m  "
+          f"{col}{rsvp:9}\033[0m  \033[1m{title}\033[0m{att_label}{cal_label}")
+PY
+    print -P ""
+}
+
+
+# /watch notify — sends a test notification + waits up to 10s.
+# First run prompts for Notifications permission. The notification has
+# Skip/Continue action buttons; clicking either prints the choice back
+# in the REPL.
+watch_notify() {
+    local agent
+    agent=$(_watch_agent_path) || return 1
+    print -P "${C[dim]}Sending test notification (10s timeout, default Continue)...${C[reset]}"
+    print -P "${C[dim]}If the banner doesn't appear, grant Notifications via${C[reset]} ${C[bright_cyan]}System Settings → Notifications${C[reset]}"
+    local result
+    result=$("$agent" notify \
+        --title "meetink test" \
+        --body "click Skip or wait 10 s" \
+        --actions "Skip,Continue" \
+        --timeout 10 \
+        --default Continue 2>&1)
+    print -P "${C[green]}✓${C[reset]} You clicked: ${C[bold]}${result}${C[reset]}"
+}
+
+
+# /watch detect — runs meeting-active and pretty-prints which signals
+# fired. Useful for verifying detection in real conditions: open Zoom,
+# run /watch detect, see "active=true source=zoom".
+watch_detect() {
+    local agent
+    agent=$(_watch_agent_path) || return 1
+    local out
+    out=$("$agent" meeting-active 2>&1)
+    "$MK_PY_VENV/bin/python" - "$out" <<'PY' 2>/dev/null || print -P "${C[red]}error:${C[reset]} couldn't parse agent output"
+import sys, json
+d = json.loads(sys.argv[1])
+active = d.get("active", False)
+source = d.get("source") or "(none)"
+signals = d.get("signals", [])
+icon = "\033[32m●" if active else "\033[90m○"
+state = "\033[32mactive\033[0m" if active else "\033[90minactive\033[0m"
+print(f"\n  {icon}\033[0m  Meeting: {state}")
+print(f"  \033[2m  source:\033[0m  {source}")
+if signals:
+    print(f"  \033[2m signals:\033[0m  " + ", ".join(signals))
+print()
+PY
+}
+
+
+# /watch dispatcher
+cmd_watch() {
+    local sub="$1"
+    case "$sub" in
+        events|list)        watch_events "$2" ;;
+        notify|notification) watch_notify ;;
+        detect|status|active) watch_detect ;;
+        # Phase-2 placeholders. Keep them returning a clear "not yet"
+        # message so users get a hint that the feature exists but the
+        # auto-record loop isn't wired yet.
+        on|start)
+            print -P "${C[dim]}/watch on coming in phase 2 — auto-record on calendar events.${C[reset]}"
+            print -P "  ${C[dim]}For now, use${C[reset]} ${C[bright_cyan]}/watch events${C[reset]}${C[dim]}, ${C[reset]}${C[bright_cyan]}/watch notify${C[reset]}${C[dim]}, ${C[reset]}${C[bright_cyan]}/watch detect${C[reset]} ${C[dim]}to validate the agent.${C[reset]}"
+            ;;
+        off|stop)
+            print -P "${C[dim]}/watch is not running yet (phase 2).${C[reset]}"
+            ;;
+        ""|help)
+            print -P ""
+            print -P "${C[bright_yellow]}/watch${C[reset]} ${C[dim]}— auto-record meetings from your calendar${C[reset]}"
+            print -P ""
+            print -P "  ${C[bright_cyan]}/watch events${C[reset]} ${C[dim]}[hours]${C[reset]}    list upcoming calendar events"
+            print -P "  ${C[bright_cyan]}/watch notify${C[reset]}            send a test notification (Skip/Continue)"
+            print -P "  ${C[bright_cyan]}/watch detect${C[reset]}            check if a video call is active right now"
+            print -P ""
+            print -P "  ${C[dim]}/watch on${C[reset]} ${C[dim]}— phase 2 (start the auto-recorder)${C[reset]}"
+            print -P "  ${C[dim]}/watch off${C[reset]} ${C[dim]}— phase 2 (stop the auto-recorder)${C[reset]}"
+            print -P ""
+            ;;
+        *)
+            print -P "${C[red]}unknown:${C[reset]} ${C[dim]}/watch $sub${C[reset]}"
+            print -P "  ${C[dim]}/watch${C[reset]} ${C[dim]}for help${C[reset]}"
+            ;;
+    esac
+}
