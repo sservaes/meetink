@@ -50,19 +50,22 @@ watch_events() {
     print -P "${C[bright_yellow]}UPCOMING EVENTS${C[reset]} ${C[dim]}(next ${hours}h)${C[reset]}"
     print -P ""
 
-    # The agent prints a JSON array on stdout. We pipe through Python to
-    # render one event per line, with start time, RSVP status, and title.
-    # All-day events are already filtered out by the agent.
+    # The agent prints a JSON array on stdout. Capture stdout / stderr
+    # separately so the parser doesn't choke on warning lines mixed in.
+    local errfile=$(mktemp -t meetink-watch.XXXXXX)
     local out
-    out=$("$agent" events --hours "$hours" 2>&1)
+    out=$("$agent" events --hours "$hours" 2>"$errfile")
     local rc=$?
     if (( rc != 0 )); then
-        print -P "${C[red]}agent error:${C[reset]} $out"
-        if [[ "$out" == *"Calendar access denied"* ]]; then
+        local err_msg=$(<"$errfile")
+        rm -f "$errfile"
+        print -P "${C[red]}agent error:${C[reset]} ${err_msg:-(unknown)}"
+        if [[ "$err_msg" == *"Calendar access denied"* ]]; then
             print -P "  ${C[dim]}Grant access via${C[reset]} ${C[bright_cyan]}System Settings → Privacy & Security → Calendar${C[reset]}"
         fi
         return 1
     fi
+    rm -f "$errfile"
 
     "$MK_PY_VENV/bin/python" - "$out" <<'PY' 2>/dev/null || print -P "${C[red]}error:${C[reset]} couldn't parse agent output"
 import sys, json
@@ -120,9 +123,14 @@ watch_notify() {
 watch_detect() {
     local agent
     agent=$(_watch_agent_path) || return 1
+    # Capture stdout and stderr separately. Earlier we 2>&1'd both
+    # together and any AppleScript / AVCapture warning leaked into the
+    # JSON, breaking the parser. Now stderr goes to a tempfile we only
+    # surface when we genuinely couldn't parse the JSON.
+    local errfile=$(mktemp -t meetink-watch.XXXXXX)
     local out
-    out=$("$agent" meeting-active 2>&1)
-    "$MK_PY_VENV/bin/python" - "$out" <<'PY' 2>/dev/null || print -P "${C[red]}error:${C[reset]} couldn't parse agent output"
+    out=$("$agent" meeting-active 2>"$errfile")
+    if "$MK_PY_VENV/bin/python" - "$out" <<'PY' 2>/dev/null
 import sys, json
 d = json.loads(sys.argv[1])
 active = d.get("active", False)
@@ -136,6 +144,18 @@ if signals:
     print(f"  \033[2m signals:\033[0m  " + ", ".join(signals))
 print()
 PY
+    then
+        rm -f "$errfile"
+        return 0
+    fi
+    print -P "${C[red]}error:${C[reset]} couldn't parse agent output"
+    print -P "  ${C[dim]}stdout:${C[reset]} ${out:-(empty)}"
+    if [[ -s "$errfile" ]]; then
+        print -P "  ${C[dim]}stderr:${C[reset]}"
+        sed 's/^/    /' "$errfile"
+    fi
+    rm -f "$errfile"
+    return 1
 }
 
 
