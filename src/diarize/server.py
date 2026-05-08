@@ -39,6 +39,10 @@ GET    /profiles                      list profile names + sample counts
 POST   /identify                      body=WAV → {speaker, confidence, runner_up?, cluster?}
 POST   /enroll?name=<name>            body=WAV → appends one sample to that profile
 DELETE /profiles/<name>               remove
+POST   /profiles/<name>/pop?count=N   drop last N samples, recompute centroid
+                                      (count defaults to 1; refuses if it
+                                      would empty the profile — use DELETE
+                                      for that)
 
 GET    /session/clusters              list current clusters (letter, count)
 POST   /session/clear                 reset clusters (called by /start)
@@ -577,6 +581,53 @@ class Handler(BaseHTTPRequestHandler):
                     "to": dst_name,
                     "samples": count,
                     "merged": merged_into_existing,
+                })
+                return
+            if url.path.startswith("/profiles/") and url.path.endswith("/pop"):
+                name = url.path[len("/profiles/"):-len("/pop")].strip()
+                if not name:
+                    self._json(400, {"error": "missing profile name"})
+                    return
+                if name not in profiles:
+                    self._json(404, {"error": f"no profile named {name}"})
+                    return
+                qs = parse_qs(url.query)
+                try:
+                    count = int(qs.get("count", ["1"])[0])
+                except ValueError:
+                    self._json(400, {"error": "count must be an integer"})
+                    return
+                if count < 1:
+                    self._json(400, {"error": "count must be >= 1"})
+                    return
+                samples = profiles[name]["samples"]
+                total = int(samples.shape[0])
+                if count >= total:
+                    self._json(400, {
+                        "error": (
+                            f"can't pop {count} of {total} — would empty "
+                            f"the profile. Use DELETE /profiles/{name} "
+                            f"instead."
+                        ),
+                    })
+                    return
+                trimmed = samples[:-count]
+                profiles[name] = {
+                    "centroid": _centroid(trimmed),
+                    "samples": trimmed,
+                }
+                _save(name)
+                remaining = int(trimmed.shape[0])
+                print(
+                    f"popped: {name} -{count} sample(s), "
+                    f"remaining={remaining}",
+                    file=sys.stderr,
+                )
+                self._json(200, {
+                    "ok": True,
+                    "name": name,
+                    "removed": count,
+                    "remaining": remaining,
                 })
                 return
             if url.path == "/enroll":

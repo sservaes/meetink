@@ -562,6 +562,34 @@ profile_assign() {
     fi
 }
 
+# Pop the last N samples off a profile and recompute its centroid.
+# Useful when /profile train picked up a stray voice — undo last sample,
+# don't trash the whole profile and re-enroll.
+profile_undo() {
+    local name="$1" count="${2:-1}"
+    if [[ -z "$name" ]]; then
+        print -P "${C[red]}usage:${C[reset]} /profile undo <name> [count]"
+        return 1
+    fi
+    if ! [[ "$count" =~ ^[0-9]+$ ]] || (( count < 1 )); then
+        print -P "${C[red]}error:${C[reset]} count must be a positive integer"
+        return 1
+    fi
+    if ! diarize_running; then
+        print -P "${C[red]}error:${C[reset]} diarize-server not running"
+        return 1
+    fi
+    local resp=$(curl -s -X POST \
+        "http://127.0.0.1:$MK_DIARIZE_PORT/profiles/$name/pop?count=$count")
+    if ! _resp_ok "$resp"; then
+        print -P "${C[red]}error:${C[reset]} $resp"
+        return 1
+    fi
+    local removed=$(print -- "$resp" | sed -nE 's/.*"removed":[[:space:]]*([0-9]+).*/\1/p')
+    local remaining=$(print -- "$resp" | sed -nE 's/.*"remaining":[[:space:]]*([0-9]+).*/\1/p')
+    print -P "${C[green]}✓${C[reset]} Dropped last ${C[bold]}${removed}${C[reset]} sample(s) from ${C[bold]}${name}${C[reset]} ${C[dim]}(${remaining} remaining)${C[reset]}"
+}
+
 # Rename a profile, OR fold one profile into an existing other (when the
 # same speaker got enrolled under two names — e.g. earlier session called
 # them BOB, this one calls them FLAVIO). Server is the source of truth;
@@ -646,6 +674,7 @@ cmd_profile() {
         assign)                profile_assign  "$2" "$3" ;;
         merge)                 profile_merge   "$2" "$3" ;;
         rename|mv)             profile_rename  "$2" "$3" ;;
+        undo|pop)              profile_undo    "$2" "$3" ;;
         *)
             print -P "${C[red]}unknown:${C[reset]} ${C[dim]}/profile $sub${C[reset]}"
             print -P "  ${C[dim]}/profile add <name>${C[reset]}              enroll a new voice (3 samples)"
