@@ -888,6 +888,10 @@ _NESTED_COMMANDS = {
         "sensitivity": WordCompleter(
             ["focused", "default", "strict"], ignore_case=True,
         ),
+        "auto-train": WordCompleter(
+            ["status", "on", "off", "floor", "margin", "min"],
+            ignore_case=True,
+        ),
     },
     "/profile": {
         "add": None,

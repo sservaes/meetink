@@ -282,6 +282,102 @@ diarize_sensitivity() {
     print -P "${C[green]}✓${C[reset]} Sensitivity → ${C[bold]}${mode}${C[reset]} ${C[dim]}(threshold=${thr}, margin=${mar}, cluster_threshold=${clt})${C[reset]}"
 }
 
+# /diarize auto-train — show or tweak the continuous self-improvement knob.
+# When on (default), high-confidence /identify matches fold back into the
+# profile so it sharpens with real conversational audio over time. The
+# guardrails (floor / margin multiplier / min-samples) are deliberately
+# strict to avoid the FLAVIO-pollution failure mode.
+diarize_auto_train() {
+    local sub="$1" val="$2"
+    if ! diarize_running; then
+        print -P "${C[red]}error:${C[reset]} diarize-server not running"
+        return 1
+    fi
+
+    case "$sub" in
+        ""|status)
+            local resp=$(curl -sf "http://127.0.0.1:$MK_DIARIZE_PORT/session/auto-train")
+            if [[ -z "$resp" ]]; then
+                print -P "${C[red]}error:${C[reset]} no response from diarize-server"
+                return 1
+            fi
+            local en=$(print -- "$resp" | sed -nE 's/.*"enabled":[[:space:]]*(true|false).*/\1/p')
+            local fl=$(print -- "$resp" | sed -nE 's/.*"floor":[[:space:]]*([0-9.]+).*/\1/p')
+            local mm=$(print -- "$resp" | sed -nE 's/.*"margin_multiplier":[[:space:]]*([0-9.]+).*/\1/p')
+            local ms=$(print -- "$resp" | sed -nE 's/.*"min_samples":[[:space:]]*([0-9]+).*/\1/p')
+            local en_dot
+            if [[ "$en" == "true" ]]; then
+                en_dot="${C[green]}● enabled${C[reset]}"
+            else
+                en_dot="${C[gray]}○ disabled${C[reset]}"
+            fi
+            print -P ""
+            print -P "${C[bright_yellow]}AUTO-TRAIN${C[reset]}"
+            print -P "  ${C[dim]}status:${C[reset]}              ${en_dot}"
+            print -P "  ${C[dim]}confidence floor:${C[reset]}    ${fl}   ${C[dim]}match must score ≥ this to qualify${C[reset]}"
+            print -P "  ${C[dim]}margin multiplier:${C[reset]}   ${mm}×   ${C[dim]}must beat runner-up by ≥ N × MARGIN${C[reset]}"
+            print -P "  ${C[dim]}min profile samples:${C[reset]} ${ms}    ${C[dim]}skip auto-train if profile has fewer${C[reset]}"
+            print -P ""
+            print -P "  ${C[dim]}/diarize auto-train on${C[reset]}              ${C[dim]}— enable${C[reset]}"
+            print -P "  ${C[dim]}/diarize auto-train off${C[reset]}             ${C[dim]}— disable${C[reset]}"
+            print -P "  ${C[dim]}/diarize auto-train floor 0.92${C[reset]}      ${C[dim]}— stricter confidence floor${C[reset]}"
+            print -P "  ${C[dim]}/diarize auto-train margin 3.0${C[reset]}      ${C[dim]}— stricter margin multiplier${C[reset]}"
+            print -P ""
+            print -P "  ${C[dim]}A bad auto-add can be peeled off with${C[reset]} ${C[bright_cyan]}/profile undo <name>${C[reset]}${C[dim]}.${C[reset]}"
+            print -P ""
+            ;;
+        on|enable)
+            curl -s -X POST "http://127.0.0.1:$MK_DIARIZE_PORT/session/auto-train?enabled=true" >/dev/null
+            print -P "${C[green]}✓${C[reset]} Auto-train enabled"
+            ;;
+        off|disable)
+            curl -s -X POST "http://127.0.0.1:$MK_DIARIZE_PORT/session/auto-train?enabled=false" >/dev/null
+            print -P "${C[green]}✓${C[reset]} Auto-train disabled"
+            ;;
+        floor)
+            if [[ -z "$val" ]]; then
+                print -P "${C[red]}usage:${C[reset]} /diarize auto-train floor <0.0-1.0>"
+                return 1
+            fi
+            local resp=$(curl -s -X POST "http://127.0.0.1:$MK_DIARIZE_PORT/session/auto-train?floor=$val")
+            if ! _resp_ok "$resp"; then
+                print -P "${C[red]}error:${C[reset]} $resp"
+                return 1
+            fi
+            print -P "${C[green]}✓${C[reset]} Auto-train confidence floor → ${C[bold]}${val}${C[reset]}"
+            ;;
+        margin)
+            if [[ -z "$val" ]]; then
+                print -P "${C[red]}usage:${C[reset]} /diarize auto-train margin <multiplier>"
+                return 1
+            fi
+            local resp=$(curl -s -X POST "http://127.0.0.1:$MK_DIARIZE_PORT/session/auto-train?margin_multiplier=$val")
+            if ! _resp_ok "$resp"; then
+                print -P "${C[red]}error:${C[reset]} $resp"
+                return 1
+            fi
+            print -P "${C[green]}✓${C[reset]} Auto-train margin multiplier → ${C[bold]}${val}×${C[reset]}"
+            ;;
+        min|min-samples|min_samples)
+            if [[ -z "$val" ]]; then
+                print -P "${C[red]}usage:${C[reset]} /diarize auto-train min <count>"
+                return 1
+            fi
+            local resp=$(curl -s -X POST "http://127.0.0.1:$MK_DIARIZE_PORT/session/auto-train?min_samples=$val")
+            if ! _resp_ok "$resp"; then
+                print -P "${C[red]}error:${C[reset]} $resp"
+                return 1
+            fi
+            print -P "${C[green]}✓${C[reset]} Auto-train min samples → ${C[bold]}${val}${C[reset]}"
+            ;;
+        *)
+            print -P "${C[red]}unknown:${C[reset]} ${C[dim]}/diarize auto-train $sub${C[reset]}"
+            print -P "  ${C[dim]}/diarize auto-train${C[reset]} ${C[dim]}for status, then on/off/floor/margin/min${C[reset]}"
+            return 1
+            ;;
+    esac
+}
+
 cmd_diarize() {
     local sub="$1"
     case "$sub" in
@@ -306,6 +402,8 @@ cmd_diarize() {
         start)             diarize_start ;;
         stop)              diarize_stop && print -P "${C[green]}✓${C[reset]} diarize-server stopped" ;;
         sensitivity|sens)  diarize_sensitivity "$2" ;;
+        auto-train|autotrain|auto_train)
+                           diarize_auto_train "$2" "$3" ;;
         *)
             print -P "${C[red]}unknown:${C[reset]} ${C[dim]}/diarize $sub${C[reset]}"
             print -P "  ${C[dim]}/diarize${C[reset]} | ${C[dim]}/diarize on${C[reset]} | ${C[dim]}/diarize off${C[reset]} | ${C[dim]}/diarize install${C[reset]} | ${C[dim]}/diarize rm${C[reset]} | ${C[dim]}/diarize sensitivity [mode]${C[reset]}"

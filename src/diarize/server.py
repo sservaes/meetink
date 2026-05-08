@@ -58,6 +58,12 @@ GET    /session/sensitivity           current threshold/margin/cluster_threshold
 POST   /session/sensitivity?mode=focused|default|strict
                                       apply a preset; takes effect on next
                                       /identify, no restart required
+GET    /session/auto-train            current auto-train settings
+POST   /session/auto-train?enabled=true|false&floor=0.88
+                                      &margin_multiplier=2.0&min_samples=5
+                                      tweak any subset; high-confidence
+                                      /identify matches fold back into the
+                                      profile when guardrails all pass
 """
 
 from __future__ import annotations
@@ -129,6 +135,71 @@ settings: dict[str, float] = {
 # Track which preset (if any) the user explicitly selected, so GET
 # /session/sensitivity can echo "focused" instead of always "custom".
 settings_preset: str = os.environ.get("MEETINK_DIARIZE_PRESET", "default")
+
+
+# --- Auto-train ------------------------------------------------------------
+#
+# When /identify scores well above noise against an enrolled profile, fold
+# the embedding back into that profile's samples. Continuous self-improvement
+# from real conversational audio without manual /profile train calls.
+#
+# Three guardrails to prevent the failure mode that bit FLAVIO earlier
+# today (pollution from a wrong-but-confident match):
+#
+#   1. Confidence floor — match cosine must clear `floor` (much higher
+#      than the matching THRESHOLD). 0.88 by default vs the matching
+#      THRESHOLD of 0.62-0.70.
+#   2. Margin multiplier — top match must beat runner-up by at least
+#      `margin_multiplier` × the current MARGIN. So in default mode
+#      (MARGIN=0.07) we require 0.14+ separation; in focused mode
+#      (MARGIN=0.12) we require 0.24+. Either way, two-profiles-tied
+#      situations don't auto-train.
+#   3. Min samples — profiles with very few samples (cold start) skip
+#      auto-train; one bad sample on a 3-sample profile shifts the
+#      centroid 25%, which is too risky.
+#
+# Anything that does land in the profile is plain append-via-_add_sample,
+# so /profile undo <name> N peels recent auto-additions cleanly. Server
+# also stderr-logs every auto-add so /diarize log surfaces them.
+auto_train_settings: dict = {
+    "enabled": os.environ.get(
+        "MEETINK_AUTO_TRAIN", "true",
+    ).lower() in ("1", "true", "yes", "on"),
+    "floor": float(os.environ.get("MEETINK_AUTO_TRAIN_FLOOR", "0.88")),
+    "margin_multiplier": float(
+        os.environ.get("MEETINK_AUTO_TRAIN_MARGIN_MULT", "2.0"),
+    ),
+    "min_samples": int(
+        os.environ.get("MEETINK_AUTO_TRAIN_MIN_SAMPLES", "5"),
+    ),
+}
+
+
+def _maybe_auto_train(
+    emb: np.ndarray,
+    name: str,
+    confidence: float,
+    runner_up_confidence: float,
+) -> bool:
+    """Append `emb` to profile `name` if all guardrails pass. Returns
+    True iff a sample was actually added."""
+    if not auto_train_settings["enabled"]:
+        return False
+    if confidence < auto_train_settings["floor"]:
+        return False
+    # Margin requirement scales with the active sensitivity preset's
+    # MARGIN: stricter presets demand stricter auto-train margin.
+    margin_gap = confidence - runner_up_confidence
+    required = settings["margin"] * auto_train_settings["margin_multiplier"]
+    if margin_gap < required:
+        return False
+    profile = profiles.get(name)
+    if profile is None:
+        return False
+    if profile["samples"].shape[0] < auto_train_settings["min_samples"]:
+        return False
+    _add_sample(name, emb)
+    return True
 
 PROFILES_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -394,6 +465,9 @@ class Handler(BaseHTTPRequestHandler):
                 "available": list(PRESETS.keys()),
             })
             return
+        if path == "/session/auto-train":
+            self._json(200, dict(auto_train_settings))
+            return
         if path == "/session/clusters":
             self._json(200, {
                 "clusters": [
@@ -424,6 +498,28 @@ class Handler(BaseHTTPRequestHandler):
                     resp["speaker"] = f"THEM-{letter}"
                     resp["cluster"] = letter
                     resp["cluster_confidence"] = sim
+                else:
+                    # High-confidence profile match → fold the embedding
+                    # back into the profile if the auto-train guardrails
+                    # all pass. The guardrails (floor / margin multiplier
+                    # / min-samples) make this conservative on purpose;
+                    # the cost of polluting a profile is much higher
+                    # than the cost of skipping a marginal match.
+                    runner_up = resp.get("runner_up_confidence") or 0.0
+                    if _maybe_auto_train(
+                        emb,
+                        resp["speaker"],
+                        resp.get("confidence") or 0.0,
+                        runner_up,
+                    ):
+                        resp["auto_trained"] = True
+                        print(
+                            f"auto-train: {resp['speaker']} += sample "
+                            f"(confidence={resp.get('confidence')}, "
+                            f"runner_up={runner_up}, "
+                            f"total={profiles[resp['speaker']]['samples'].shape[0]})",
+                            file=sys.stderr,
+                        )
                 self._json(200, resp)
                 return
             if url.path == "/session/clear":
@@ -492,6 +588,71 @@ class Handler(BaseHTTPRequestHandler):
                     "from": src_letter,
                     "into": dst_letter,
                     "samples": count,
+                })
+                return
+            if url.path == "/session/auto-train":
+                qs = parse_qs(url.query)
+                changed: dict = {}
+                if "enabled" in qs:
+                    v = qs["enabled"][0].strip().lower()
+                    auto_train_settings["enabled"] = v in (
+                        "1", "true", "yes", "on",
+                    )
+                    changed["enabled"] = auto_train_settings["enabled"]
+                if "floor" in qs:
+                    try:
+                        f = float(qs["floor"][0])
+                    except ValueError:
+                        self._json(400, {"error": "floor must be a number"})
+                        return
+                    if not (0.0 <= f <= 1.0):
+                        self._json(400, {"error": "floor must be between 0 and 1"})
+                        return
+                    auto_train_settings["floor"] = f
+                    changed["floor"] = f
+                if "margin_multiplier" in qs:
+                    try:
+                        m = float(qs["margin_multiplier"][0])
+                    except ValueError:
+                        self._json(400, {
+                            "error": "margin_multiplier must be a number",
+                        })
+                        return
+                    if m < 0:
+                        self._json(400, {
+                            "error": "margin_multiplier must be >= 0",
+                        })
+                        return
+                    auto_train_settings["margin_multiplier"] = m
+                    changed["margin_multiplier"] = m
+                if "min_samples" in qs:
+                    try:
+                        n = int(qs["min_samples"][0])
+                    except ValueError:
+                        self._json(400, {
+                            "error": "min_samples must be an integer",
+                        })
+                        return
+                    if n < 1:
+                        self._json(400, {
+                            "error": "min_samples must be >= 1",
+                        })
+                        return
+                    auto_train_settings["min_samples"] = n
+                    changed["min_samples"] = n
+                if not changed:
+                    self._json(400, {
+                        "error": (
+                            "no settings provided — pass at least one of "
+                            "?enabled=&floor=&margin_multiplier=&min_samples="
+                        ),
+                    })
+                    return
+                print(f"auto-train updated: {changed}", file=sys.stderr)
+                self._json(200, {
+                    "ok": True,
+                    "changed": changed,
+                    **dict(auto_train_settings),
                 })
                 return
             if url.path == "/session/sensitivity":
