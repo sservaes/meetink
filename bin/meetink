@@ -745,6 +745,7 @@ case "${1:-}" in
     index)             shift; cmd_index "$@" ;;
     watch)             shift; cmd_watch "$@" ;;
     _build_agent)      build_agent ;;
+    _build_capture)    build_capture ;;
     prompt|vocab)
         mkdir -p "${MK_PROMPT:h}"
         [[ -f "$MK_PROMPT" ]] || touch "$MK_PROMPT"
