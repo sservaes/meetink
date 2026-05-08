@@ -70,14 +70,25 @@ class MLXRuntime:
 
     def maybe_release_idle(self) -> bool:
         """Release the model if it's been idle longer than IDLE_RELEASE_SECONDS.
-        Returns True if a release happened."""
-        with self._lock:
+        Returns True if a release happened.
+
+        Non-blocking: a generation in flight holds the lock, so we'd otherwise
+        stall the caller (often the footer tick) for the duration of the
+        stream. If the lock is busy we just bail — the next tick will retry."""
+        # Lockless fast-path: nothing loaded, nothing to release.
+        if self._model is None:
+            return False
+        if not self._lock.acquire(blocking=False):
+            return False
+        try:
             if self._model is None:
                 return False
             if time.time() - self._last_used > IDLE_RELEASE_SECONDS:
                 self._release_locked()
                 return True
             return False
+        finally:
+            self._lock.release()
 
     def release(self) -> None:
         with self._lock:

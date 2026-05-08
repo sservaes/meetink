@@ -23,6 +23,74 @@
 CONTEXT_SUMMARY_THRESHOLD="${MEETINK_CONTEXT_SUMMARY_THRESHOLD:-800}"
 
 
+# Per-quant token budget for the local /ask path. Mirrors _ASK_TOKEN_BUDGETS
+# in src/repl/repl.py — keep them in sync. The local path reserves 600
+# tokens for response, so the *available* budget for context is slightly
+# smaller, but for the /context list overshoot warning we compare against
+# the model's effective budget (matches what the user sees in the footer
+# context-bar chip).
+_local_budget_tokens() {
+    local m="qwen3.5-2b"
+    if typeset -f local_llm_active_get >/dev/null; then
+        m=$(local_llm_active_get 2>/dev/null)
+    fi
+    case "$m" in
+        qwen3.5-0.8b) print -n -- "8000" ;;
+        qwen3.5-2b)   print -n -- "16000" ;;
+        qwen3.5-4b)   print -n -- "16000" ;;
+        qwen3.5-9b)   print -n -- "32000" ;;
+        *)            print -n -- "8000" ;;
+    esac
+}
+
+# Approximate window for the active Claude model. Standard 4.x ships at
+# 200K; the [1m] extended-window variants take 1M. Mirrors _claude_budget
+# in src/repl/repl.py.
+_claude_budget_tokens() {
+    local m="claude-sonnet-4-6"
+    if typeset -f claude_model_active >/dev/null; then
+        m=$(claude_model_active 2>/dev/null)
+    fi
+    if [[ "${m:l}" == *1m* ]]; then
+        print -n -- "1000000"
+    else
+        print -n -- "200000"
+    fi
+}
+
+# Format a budget value as a compact human label: 200000 → 200K, 1000000 → 1M.
+_human_budget() {
+    local b=$1
+    if (( b >= 1000000 )); then
+        print -n -- "$((b / 1000000))M"
+    elif (( b >= 1000 )); then
+        print -n -- "$((b / 1000))K"
+    else
+        print -n -- "$b"
+    fi
+}
+
+# Render "<colored pct>% of <budget> · <model>[ ⚠ overshoot]" given:
+#   $1 = used tokens   $2 = budget   $3 = model label
+_budget_chip() {
+    local used=$1 budget=$2 label=$3
+    if (( budget == 0 )); then
+        print -n -- "${C[dim]}budget unknown${C[reset]}"
+        return
+    fi
+    local pct=$((100 * used / budget))
+    local colour
+    if   (( pct < 50 )); then colour="${C[green]}"
+    elif (( pct < 90 )); then colour="${C[yellow]}"
+    else                       colour="${C[red]}"
+    fi
+    local hb=$(_human_budget $budget)
+    local marker=""
+    (( pct > 100 )) && marker="  ${C[red]}⚠ overshoot${C[reset]}"
+    print -n -- "${colour}${pct}%${C[reset]} ${C[dim]}of ${hb} · ${label}${C[reset]}${marker}"
+}
+
+
 # Project's _context/ directory. Created on first /context add.
 _context_dir() {
     print -n -- "$MK_TRANSCRIPTS_DIR/_context"
@@ -239,9 +307,24 @@ context_list() {
                 "$name" "${source:-(unknown)}" "$tokens"
         fi
     done
+    # Budget chips compare the totals against the active backend's window
+    # so the user sees at a glance whether their attached docs fit. Each row
+    # measures the path that actually consumes that total: the claude path
+    # uses the full markdown, the local path uses summaries.
+    local local_budget=$(_local_budget_tokens)
+    local local_label="qwen3.5-2b"
+    if typeset -f local_llm_active_get >/dev/null; then
+        local_label=$(local_llm_active_get 2>/dev/null)
+    fi
+    local claude_budget=$(_claude_budget_tokens)
+    local claude_label="Sonnet"
+    if typeset -f claude_model_active >/dev/null; then
+        claude_label=$(claude_model_active 2>/dev/null)
+    fi
+
     print -P ""
-    print -P "  ${C[dim]}Total full:${C[reset]}     ${total_full} tokens ${C[dim]}(used by /ask when backend=claude)${C[reset]}"
-    print -P "  ${C[dim]}Total compact:${C[reset]}  ${total_summary} tokens ${C[dim]}(used by /ask when backend=local)${C[reset]}"
+    print -P "  ${C[dim]}Total full:${C[reset]}     ${total_full} tokens · $(_budget_chip $total_full $claude_budget $claude_label) ${C[dim]}(claude path)${C[reset]}"
+    print -P "  ${C[dim]}Total compact:${C[reset]}  ${total_summary} tokens · $(_budget_chip $total_summary $local_budget $local_label) ${C[dim]}(local path)${C[reset]}"
     print -P ""
     print -P "  ${C[dim]}/context add <file>${C[reset]}     ${C[dim]}/context show <name>${C[reset]}     ${C[dim]}/context rm <name>${C[reset]}"
     print -P ""

@@ -555,9 +555,35 @@ def _footer_bottom_raw() -> str:
     return FOOTER_SEP.join(parts)
 
 
+# Last time the footer-tick checked for idle MLX release. The sweep is cheap
+# (lockless when nothing is loaded; non-blocking when something is) but we
+# still don't want to import + dispatch every refresh — once per 30s is more
+# than fine since IDLE_RELEASE_SECONDS is 5 minutes.
+_idle_sweep_ts: float = 0.0
+
+
+def _maybe_idle_sweep() -> None:
+    """Periodic idle-release poll. The bottom of handle_command already
+    sweeps after non-/ask commands, but if the user just sits at the
+    prompt (no commands at all) the model would otherwise stay resident
+    forever. This piggybacks on the footer's 1s tick so the sweep keeps
+    happening even during quiet stretches."""
+    global _idle_sweep_ts
+    now = time.time()
+    if now - _idle_sweep_ts < 30:
+        return
+    _idle_sweep_ts = now
+    try:
+        from llm.mlx_runtime import get_runtime
+        get_runtime().maybe_release_idle()
+    except ImportError:
+        pass
+
+
 def bottom_toolbar():
     """prompt_toolkit calls this every refresh tick to redraw the bottom
     region under the prompt. Two lines: static config above, runtime below."""
+    _maybe_idle_sweep()
     return ANSI(_footer_top_raw() + "\n" + _footer_bottom_raw())
 
 
