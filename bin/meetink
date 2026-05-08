@@ -1,35 +1,67 @@
 #!/bin/zsh
-# local-speech — local-first meeting transcription for macOS
-# https://github.com/sservaes/local-speech
+# meetink — local-first meeting transcription for macOS
+# https://github.com/sservaes/meetink
 
 set -e
 
 # --- Locate self ---
 SCRIPT_PATH="${0:A}"
-LS_BIN_DIR="${SCRIPT_PATH:h}"
-LS_ROOT="${LS_BIN_DIR:h}"
+MK_BIN_DIR="${SCRIPT_PATH:h}"
+MK_ROOT="${MK_BIN_DIR:h}"
 
 # --- Config ---
-LOCAL_SPEECH_VERSION="0.1.0"
-LS_HOME="${LOCAL_SPEECH_HOME:-$HOME/.local-speech}"
-LS_MODEL="${LOCAL_SPEECH_MODEL:-$LS_HOME/models/ggml-small.en.bin}"
-LS_TRANSCRIPT="${LOCAL_SPEECH_TRANSCRIPT:-$LS_HOME/transcripts/live.txt}"
-LS_PROMPT="${LOCAL_SPEECH_PROMPT:-$LS_HOME/prompts/default.txt}"
-LS_PORT=8178
+MEETINK_VERSION="0.1.0"
+MK_HOME="${MEETINK_HOME:-$HOME/.meetink}"
+MK_MODEL="${MEETINK_MODEL:-}"   # resolved after models.sh is sourced
+# Transcripts live in a visible folder by default. Override the directory via
+# MEETINK_TRANSCRIPTS_DIR, or pin the live-symlink path with the older
+# MEETINK_TRANSCRIPT (expects a full file path).
+MK_TRANSCRIPTS_DIR="${MEETINK_TRANSCRIPTS_DIR:-$HOME/Documents/meetink}"
+# Base path for project enumeration (subdirs of this are projects). Stays
+# fixed even after project_resolve_dirs adjusts $MK_TRANSCRIPTS_DIR to point
+# inside an active project's folder.
+MK_TRANSCRIPTS_BASE="$MK_TRANSCRIPTS_DIR"
+MK_TRANSCRIPT="${MEETINK_TRANSCRIPT:-$MK_TRANSCRIPTS_DIR/live.txt}"
+MK_PROMPT="${MEETINK_PROMPT:-$MK_HOME/prompts/default.txt}"
+MK_PORT=8178
 
-PID_FILE="/tmp/local-speech-capture.pid"
-SERVER_PID_FILE="/tmp/local-speech-whisper.pid"
+PID_FILE="/tmp/meetink-capture.pid"
+SERVER_PID_FILE="/tmp/meetink-whisper.pid"
+
+# Python venv used for the prompt_toolkit REPL (and shared with diarize-server
+# when that's installed — avoids two venvs for the same tools).
+MK_PY_VENV="$MK_HOME/py-venv"
 
 # --- UI helpers ---
-source "$LS_ROOT/src/lib/ui.sh"
-source "$LS_ROOT/src/lib/welcome.sh"
+source "$MK_ROOT/src/lib/ui.sh"
+source "$MK_ROOT/src/lib/welcome.sh"
+source "$MK_ROOT/src/lib/window.sh"
+source "$MK_ROOT/src/lib/models.sh"
+source "$MK_ROOT/src/lib/titling.sh"
+source "$MK_ROOT/src/lib/diarize.sh"
+source "$MK_ROOT/src/lib/projects.sh"
+source "$MK_ROOT/src/lib/identity.sh"
+source "$MK_ROOT/src/lib/ask.sh"
+source "$MK_ROOT/src/lib/summary.sh"
+source "$MK_ROOT/src/lib/context.sh"
+source "$MK_ROOT/src/lib/repl.sh"
 
-# --- Locate the Swift binary (preferred location: $LS_HOME/bin) ---
+# If an active project is configured, redirect $MK_TRANSCRIPTS_DIR /
+# $MK_TRANSCRIPT into its folder before any subcommand runs.
+project_resolve_dirs
+
+# Resolve the active model AFTER models.sh is sourced, so the user's
+# config-file selection takes effect. Explicit MEETINK_MODEL still wins.
+if [[ -z "$MK_MODEL" ]]; then
+    MK_MODEL=$(model_path "$(model_active)")
+fi
+
+# --- Locate the Swift binary (preferred location: $MK_HOME/bin) ---
 find_capture_binary() {
     local candidates=(
-        "$LS_HOME/bin/local-speech-capture"
-        "$LS_ROOT/src/capture/local-speech-capture"
-        "$LS_ROOT/.build/release/local-speech-capture"
+        "$MK_HOME/bin/meetink-capture"
+        "$MK_ROOT/src/capture/meetink-capture"
+        "$MK_ROOT/.build/release/meetink-capture"
     )
     for c in $candidates; do
         if [[ -x "$c" ]]; then
@@ -61,7 +93,7 @@ find_sdk() {
 # --- Build Swift binary ---
 build_capture() {
     print -P "${C[bright_yellow]}▸${C[reset]} Building capture binary..."
-    cd "$LS_ROOT/src/capture"
+    cd "$MK_ROOT/src/capture"
     if ! command -v swiftc >/dev/null 2>&1; then
         print -P "${C[red]}error:${C[reset]} ${C[bold]}swiftc${C[reset]} not found"
         print -P "  Install Xcode Command Line Tools:"
@@ -77,7 +109,7 @@ build_capture() {
     fi
     print -P "  ${C[dim]}using SDK: ${sdk}${C[reset]}"
 
-    swiftc -O -o local-speech-capture Sources/main.swift \
+    swiftc -O -o meetink-capture Sources/main.swift \
         -framework ScreenCaptureKit -framework AVFoundation \
         -framework CoreMedia -framework CoreAudio \
         -parse-as-library \
@@ -86,16 +118,16 @@ build_capture() {
             print -P "${C[red]}error:${C[reset]} build failed"
             exit 1
         }
-    mkdir -p "$LS_HOME/bin"
-    cp local-speech-capture "$LS_HOME/bin/local-speech-capture"
-    print -P "${C[green]}✓${C[reset]} Built: ${C[dim]}$LS_HOME/bin/local-speech-capture${C[reset]}"
+    mkdir -p "$MK_HOME/bin"
+    cp meetink-capture "$MK_HOME/bin/meetink-capture"
+    print -P "${C[green]}✓${C[reset]} Built: ${C[dim]}$MK_HOME/bin/meetink-capture${C[reset]}"
     cd - > /dev/null
 }
 
 # --- Download whisper model ---
 download_model() {
     local model_name="${1:-small.en}"
-    local target="$LS_HOME/models/ggml-${model_name}.bin"
+    local target="$MK_HOME/models/ggml-${model_name}.bin"
     local url="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-${model_name}.bin"
 
     if [[ -f "$target" ]]; then
@@ -104,7 +136,7 @@ download_model() {
     fi
 
     print -P "${C[bright_yellow]}▸${C[reset]} Downloading whisper model (${model_name}, ~500 MB)..."
-    mkdir -p "$LS_HOME/models"
+    mkdir -p "$MK_HOME/models"
     if ! curl -L --fail --progress-bar -o "$target" "$url"; then
         print -P "${C[red]}error:${C[reset]} download failed"
         rm -f "$target"
@@ -129,33 +161,210 @@ install_whisper() {
     print -P "${C[green]}✓${C[reset]} whisper-cpp installed"
 }
 
+# --- Python REPL bootstrap ---
+# The interactive REPL is implemented in Python (prompt_toolkit) so the
+# bottom-pinned status bar renders reliably across resizes and terminal
+# emulators. zsh handles only the CLI / setup paths.
+
+repl_install_pytools() {
+    # Ensure uv exists (lightning-fast Python package manager).
+    if ! command -v uv >/dev/null 2>&1; then
+        if ! command -v brew >/dev/null 2>&1; then
+            return 1
+        fi
+        print -P "${C[bright_yellow]}▸${C[reset]} Installing uv..."
+        brew install uv >/dev/null 2>&1 || return 1
+    fi
+    # Create the venv if missing
+    if [[ ! -x "$MK_PY_VENV/bin/python" ]]; then
+        print -P "${C[bright_yellow]}▸${C[reset]} Creating Python venv for the REPL..."
+        if ! uv venv "$MK_PY_VENV" --python 3.11 >/dev/null 2>&1 \
+           && ! uv venv "$MK_PY_VENV" >/dev/null 2>&1; then
+            return 1
+        fi
+    fi
+    # Ensure prompt_toolkit is installed
+    if ! "$MK_PY_VENV/bin/python" -c 'import prompt_toolkit' 2>/dev/null; then
+        print -P "${C[bright_yellow]}▸${C[reset]} Installing prompt_toolkit..."
+        uv pip install --python "$MK_PY_VENV/bin/python" --quiet prompt_toolkit \
+            >/dev/null 2>&1 || return 1
+    fi
+    return 0
+}
+
+# Launch the Python REPL. Falls back to the zsh REPL if Python tooling
+# isn't available and can't be installed.
+launch_python_repl() {
+    if ! repl_install_pytools; then
+        print -P "${C[yellow]}⚠${C[reset]} Couldn't set up the Python REPL — falling back to the zsh REPL."
+        repl_loop
+        return
+    fi
+    MK_LAUNCHER="$SCRIPT_PATH" \
+        "$MK_PY_VENV/bin/python" "$MK_ROOT/src/repl/repl.py"
+}
+
+# --- Migrate legacy local-speech install ---
+# The project was renamed from local-speech → meetink. If the user installed
+# the old version, move ~/.local-speech → ~/.meetink (and the transcripts
+# folder), and rename the inner capture binary. One-time, idempotent.
+migrate_legacy_install() {
+    local old_home="$HOME/.local-speech"
+    local old_tx="$HOME/Documents/local-speech"
+    local migrated=0
+
+    if [[ -d "$old_home" ]] && [[ ! -d "$MK_HOME" ]]; then
+        if mv "$old_home" "$MK_HOME" 2>/dev/null; then
+            # Rename the renamed binary inside (was local-speech-capture).
+            if [[ -f "$MK_HOME/bin/local-speech-capture" ]]; then
+                mv "$MK_HOME/bin/local-speech-capture" "$MK_HOME/bin/meetink-capture"
+            fi
+            migrated=1
+        fi
+    fi
+
+    if [[ -d "$old_tx" ]] && [[ ! -d "$MK_TRANSCRIPTS_DIR" ]]; then
+        if mv "$old_tx" "$MK_TRANSCRIPTS_DIR" 2>/dev/null; then
+            # The old live.txt symlink pointed at an absolute path inside
+            # ~/Documents/local-speech/, which no longer exists. Drop the
+            # broken symlink — /start will recreate one for the next session.
+            local live="$MK_TRANSCRIPTS_DIR/live.txt"
+            [[ -L "$live" && ! -e "$live" ]] && rm -f "$live"
+            migrated=1
+        fi
+    fi
+
+    if (( migrated )); then
+        print -P "${C[dim]}Migrated local-speech → meetink (data, binary, transcripts)${C[reset]}"
+    fi
+}
+
+# --- Migrate legacy transcripts ---
+# One-time move: old default was $MK_HOME/transcripts/ (hidden); new default
+# is $MK_TRANSCRIPTS_DIR (visible, defaults to ~/Documents/meetink/).
+# Renames the singleton "live.txt" using its mtime so it isn't overwritten
+# the next time we set up a fresh symlink.
+migrate_transcripts() {
+    local old_dir="$MK_HOME/transcripts"
+    [[ -d "$old_dir" ]] || return 0
+
+    mkdir -p "$MK_TRANSCRIPTS_DIR"
+    local moved=0
+
+    setopt local_options null_glob
+    for f in "$old_dir"/*; do
+        [[ -f "$f" ]] || continue
+        local basename="${f:t}"
+        local target
+        if [[ "$basename" == "live.txt" ]]; then
+            local mtime=$(stat -f "%Sm" -t "%Y-%m-%d_%H-%M-%S" "$f" 2>/dev/null)
+            [[ -z "$mtime" ]] && mtime=$(date '+%Y-%m-%d_%H-%M-%S')
+            target="$MK_TRANSCRIPTS_DIR/${mtime}.txt"
+        else
+            target="$MK_TRANSCRIPTS_DIR/$basename"
+        fi
+        [[ -e "$target" ]] && continue
+        if mv "$f" "$target" 2>/dev/null; then
+            moved=$((moved + 1))
+        fi
+    done
+
+    if (( moved > 0 )); then
+        print -P "${C[dim]}Migrated $moved transcript(s) to ${MK_TRANSCRIPTS_DIR/$HOME/~}${C[reset]}"
+    fi
+    rmdir "$old_dir" 2>/dev/null
+}
+
 # --- Setup wizard ---
 cmd_setup() {
     print -P ""
-    print -P "${C[bold]}local·speech setup${C[reset]}"
-    print -P "${C[dim]}This will install dependencies and download the whisper model.${C[reset]}"
+    print -P "${C[bold]}meetink setup${C[reset]}"
     print -P ""
 
-    mkdir -p "$LS_HOME"/{bin,models,transcripts,prompts}
-
-    # Copy default prompt if missing
-    if [[ ! -f "$LS_PROMPT" ]] && [[ -f "$LS_ROOT/src/capture/prompts/default.txt" ]]; then
-        cp "$LS_ROOT/src/capture/prompts/default.txt" "$LS_PROMPT"
-        print -P "${C[green]}✓${C[reset]} Default prompt installed: ${C[dim]}$LS_PROMPT${C[reset]}"
+    # Hard requirement: Apple Silicon. Whisper.cpp + CoreML companion + MLX
+    # all require ARM64 Mac. We bail clearly rather than silently producing
+    # a broken install on Intel.
+    local arch=$(uname -m)
+    if [[ "$arch" != "arm64" ]]; then
+        print -P "${C[red]}error:${C[reset]} meetink requires Apple Silicon (M-series). Detected: ${C[bold]}${arch}${C[reset]}"
+        print -P "  Intel Macs aren't supported — the LLM stack (MLX) is ARM-only,"
+        print -P "  and the Whisper acceleration we ship leans on the Apple Neural Engine."
+        exit 1
     fi
 
-    # 1. whisper.cpp
+    # Total download budget — surfaced up-front so users can bail before we
+    # start pulling 3 GB of models. Numbers are rough but honest:
+    #   whisper small.en .bin (~466 MB) + CoreML companion (~155 MB)  ≈ 620 MB
+    #   sherpa-onnx WeSpeaker speaker-embedding ONNX                   ≈  25 MB
+    #   mlx-community/Qwen3.5-2B-4bit (default) snapshot               ≈ 1.2 GB
+    #   pip wheels (mlx-lm, sherpa-onnx, prompt_toolkit, …)            ≈ 200 MB
+    #   brew tarballs (whisper-cpp, ffmpeg, uv if missing)              ≈ 100 MB
+    print -P "${C[dim]}This will install on this Mac:${C[reset]}"
+    print -P "  ${C[dim]}• whisper.cpp + CoreML encoder companion${C[reset]} ${C[bright_yellow]}~620 MB${C[reset]}"
+    print -P "  ${C[dim]}• Speaker identification (sherpa-onnx)${C[reset]}    ${C[bright_yellow]}~25 MB${C[reset]}"
+    print -P "  ${C[dim]}• Local LLM (Qwen3.5-2B via MLX)${C[reset]}          ${C[bright_yellow]}~1.2 GB${C[reset]}"
+    print -P "  ${C[dim]}• Python venv + pip dependencies${C[reset]}          ${C[bright_yellow]}~200 MB${C[reset]}"
+    print -P "  ${C[dim]}• Homebrew packages (whisper-cpp, ffmpeg)${C[reset]} ${C[bright_yellow]}~100 MB${C[reset]}"
+    print -P "  ${C[dim]}                                              ────────${C[reset]}"
+    print -P "  ${C[dim]}                                          ${C[bright_yellow]}~2.2 GB total${C[reset]}"
+    print -P ""
+    print -nP "  Continue? ${C[dim]}(Y/n)${C[reset]}: "
+    local go=""
+    read go
+    if [[ "$go" == "n" || "$go" == "N" ]]; then
+        print -P "${C[dim]}aborted.${C[reset]}"
+        return 1
+    fi
+
+    mkdir -p "$MK_HOME"/{bin,models,prompts}
+    mkdir -p "$MK_TRANSCRIPTS_DIR"
+    migrate_transcripts
+
+    # Copy default prompt if missing
+    if [[ ! -f "$MK_PROMPT" ]] && [[ -f "$MK_ROOT/src/capture/prompts/default.txt" ]]; then
+        cp "$MK_ROOT/src/capture/prompts/default.txt" "$MK_PROMPT"
+        print -P "${C[green]}✓${C[reset]} Default prompt installed: ${C[dim]}$MK_PROMPT${C[reset]}"
+    fi
+
+    # 1. whisper.cpp via Homebrew
+    print -P ""
+    print -P "${C[bright_yellow]}[1/5] whisper.cpp${C[reset]}"
     install_whisper
 
-    # 2. Build Swift binary
+    # 2. Swift capture binary
+    print -P ""
+    print -P "${C[bright_yellow]}[2/5] capture binary${C[reset]}"
     if ! find_capture_binary >/dev/null 2>&1; then
         build_capture
     else
         print -P "${C[green]}✓${C[reset]} Capture binary present"
     fi
 
-    # 3. Whisper model
-    download_model "small.en"
+    # 3. Whisper model picker (still interactive — the user genuinely cares
+    # which language/quality tier to install, and small.en isn't always the
+    # right default for non-English use).
+    print -P ""
+    print -P "${C[bright_yellow]}[3/5] whisper model${C[reset]}"
+    model_setup_picker
+
+    # 4. REPL Python venv + mlx-lm + Qwen3.5 default. Always installed —
+    # this is "the only option" path the user asked for.
+    print -P ""
+    print -P "${C[bright_yellow]}[4/5] AI titling + /ask${C[reset]}"
+    print -P "${C[dim]}Local LLM via Apple's MLX framework — Metal + Neural Engine acceleration.${C[reset]}"
+    if ! repl_install_pytools; then
+        print -P "${C[red]}error:${C[reset]} couldn't set up the REPL Python venv — aborting"
+        exit 1
+    fi
+    llm_install
+
+    # 5. Diarize sidecar + speaker-embedding ONNX. Also always installed.
+    # /diarize on/off still controls whether it's *active* per-meeting; the
+    # install just makes the option available without further setup.
+    print -P ""
+    print -P "${C[bright_yellow]}[5/5] speaker identification${C[reset]}"
+    print -P "${C[dim]}sherpa-onnx (CoreML provider) for voice fingerprinting.${C[reset]}"
+    diarize_install
 
     print -P ""
     print -P "${C[green]}${C[bold]}Setup complete.${C[reset]}"
@@ -164,7 +373,7 @@ cmd_setup() {
     print -P "  ${C[dim]}1.${C[reset]} Grant ${C[bold]}Screen & System Audio Recording${C[reset]} permission to your terminal"
     print -P "     ${C[dim]}System Settings → Privacy & Security → Screen & System Audio Recording${C[reset]}"
     print -P "  ${C[dim]}2.${C[reset]} Grant ${C[bold]}Microphone${C[reset]} permission to your terminal"
-    print -P "  ${C[dim]}3.${C[reset]} Run ${C[bright_cyan]}local-speech start${C[reset]}"
+    print -P "  ${C[dim]}3.${C[reset]} Run ${C[bright_cyan]}meetink start${C[reset]}"
     print -P ""
 }
 
@@ -175,33 +384,44 @@ start_whisper_server() {
         return 0
     fi
     if ! command -v whisper-server >/dev/null 2>&1; then
-        print -P "${C[red]}error:${C[reset]} whisper-server not found. Run ${C[bright_cyan]}local-speech setup${C[reset]}"
+        print -P "${C[red]}error:${C[reset]} whisper-server not found. Run ${C[bright_cyan]}meetink setup${C[reset]}"
         exit 1
     fi
-    if [[ ! -f "$LS_MODEL" ]]; then
-        print -P "${C[red]}error:${C[reset]} model not found at $LS_MODEL"
-        print -P "  Run ${C[bright_cyan]}local-speech setup${C[reset]} to download it"
+    if [[ ! -f "$MK_MODEL" ]]; then
+        print -P "${C[red]}error:${C[reset]} model not found at $MK_MODEL"
+        print -P "  Run ${C[bright_cyan]}meetink setup${C[reset]} to download it"
         exit 1
     fi
 
-    print -P "${C[dim]}Starting whisper-server (port $LS_PORT)...${C[reset]}"
+    # Tinydiarize models embed `-tdrz` in the filename. When in use, ask
+    # whisper-server to emit [SPEAKER_TURN] markers so main.swift can split
+    # THEM into THEM-A / THEM-B / … as speakers change.
+    local extra_args=()
+    if [[ "$MK_MODEL" == *-tdrz* ]]; then
+        extra_args+=(-tdrz)
+        print -P "${C[dim]}  (tdrz model — speaker-turn detection enabled)${C[reset]}"
+    fi
+
+    print -P "${C[dim]}Starting whisper-server (port $MK_PORT)...${C[reset]}"
     whisper-server \
-        -m "$LS_MODEL" \
-        --port "$LS_PORT" \
+        -m "$MK_MODEL" \
+        --port "$MK_PORT" \
         --host 127.0.0.1 \
         -t 4 \
         -l en \
-        > /tmp/local-speech-whisper.log 2>&1 &
+        $extra_args \
+        > /tmp/meetink-whisper.log 2>&1 &
     echo $! > "$SERVER_PID_FILE"
+    disown 2>/dev/null || true
 
     for i in {1..30}; do
-        if curl -s -o /dev/null "http://127.0.0.1:$LS_PORT/" 2>/dev/null; then
+        if curl -s -o /dev/null "http://127.0.0.1:$MK_PORT/" 2>/dev/null; then
             print -P "${C[green]}✓${C[reset]} whisper-server ready"
             return 0
         fi
         sleep 1
     done
-    print -P "${C[red]}error:${C[reset]} whisper-server failed to start. Check /tmp/local-speech-whisper.log"
+    print -P "${C[red]}error:${C[reset]} whisper-server failed to start. Check /tmp/meetink-whisper.log"
     exit 1
 }
 
@@ -220,7 +440,7 @@ stop_whisper_server() {
 cmd_start() {
     if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
         print -P "${C[yellow]}Already recording${C[reset]} (PID $(cat "$PID_FILE"))"
-        print -P "  Transcript: ${C[dim]}$LS_TRANSCRIPT${C[reset]}"
+        print -P "  Transcript: ${C[dim]}$MK_TRANSCRIPT${C[reset]}"
         exit 1
     fi
 
@@ -231,22 +451,50 @@ cmd_start() {
         binary=$(find_capture_binary) || { print -P "${C[red]}error:${C[reset]} build did not produce a binary"; exit 1 }
     fi
 
-    mkdir -p "$LS_HOME"/{transcripts,prompts}
+    mkdir -p "$MK_TRANSCRIPTS_DIR" "$MK_HOME/prompts"
+    migrate_transcripts
+
+    # Re-resolve MK_MODEL each /start so /model use picks up next time.
+    if [[ -z "$MEETINK_MODEL" ]]; then
+        MK_MODEL=$(model_path "$(model_active)")
+    fi
+
+    # Each session writes to its own timestamped file so meetings don't
+    # overwrite each other. live.txt is a symlink to the current session,
+    # which keeps `/tail` and any external "tail -f live.txt" working.
+    # Pre-create (touch) so window_open_tail's `tail -f` doesn't race the
+    # Swift binary's first write — its header.write() will overwrite anyway.
+    local session_file="$MK_TRANSCRIPTS_DIR/$(date '+%Y-%m-%d_%H-%M-%S').txt"
+    touch "$session_file"
+    ln -sfn "$session_file" "$MK_TRANSCRIPT"
 
     start_whisper_server
+    # diarize-server is optional; quietly skipped if not installed.
+    diarize_start
+    # Clear cluster state from any previous recording so THEM-A in this
+    # session is truly a new voice, not yesterday's leftover. Best-effort —
+    # silently skipped if the server isn't up.
+    curl -s -o /dev/null -X POST "http://127.0.0.1:$MK_DIARIZE_PORT/session/clear" 2>/dev/null || true
 
-    LOCAL_SPEECH_MODEL="$LS_MODEL" \
-    LOCAL_SPEECH_TRANSCRIPT="$LS_TRANSCRIPT" \
-    LOCAL_SPEECH_PROMPT="$LS_PROMPT" \
-        "$binary" 2>/tmp/local-speech-capture.log &
+    MEETINK_MODEL="$MK_MODEL" \
+    MEETINK_TRANSCRIPT="$session_file" \
+    MEETINK_PROMPT="$MK_PROMPT" \
+    MEETINK_ME_NAME="$(me_name_get)" \
+        "$binary" 2>/tmp/meetink-capture.log &
     echo $! > "$PID_FILE"
+    disown 2>/dev/null || true
 
     print -P ""
     print -P "${C[green]}${C[bold]}● Recording started${C[reset]}  (PID $(cat "$PID_FILE"))"
-    print -P "  Transcript: ${C[bright_cyan]}$LS_TRANSCRIPT${C[reset]}"
-    print -P "  Stop with: ${C[bright_cyan]}local-speech stop${C[reset]}"
-    print -P "  Follow live: ${C[bright_cyan]}local-speech tail${C[reset]}"
+    print -P "  Transcript: ${C[bright_cyan]}${session_file/$HOME/~}${C[reset]}"
+    print -P "  Live link:  ${C[dim]}${MK_TRANSCRIPT/$HOME/~}${C[reset]}"
+    print -P "  Stop with: ${C[bright_cyan]}/stop${C[reset]}"
     print -P ""
+
+    # Auto-open a separate Terminal window tailing the live transcript so
+    # the user can keep the meetink REPL in front for /stop while the
+    # transcript scrolls in its own window.
+    window_open_tail "$MK_TRANSCRIPT"
 }
 
 # --- Stop command ---
@@ -269,11 +517,29 @@ cmd_stop() {
     fi
     rm -f "$PID_FILE"
     stop_whisper_server
+    # Note: we deliberately leave diarize-server running across /stop. It's
+    # cheap (~25MB embedding model) and the user often wants to inspect or
+    # promote clusters via /profile assign / /profile clusters after the
+    # recording ends. Killing it would 503 those follow-ups. Use
+    # /diarize stop or /diarize off to actually shut it down.
+    # Close the tail window we opened on /start.
+    window_close_tail
 
     print -P "${C[green]}✓${C[reset]} Stopped."
-    if [[ -f "$LS_TRANSCRIPT" ]]; then
-        local lines=$(wc -l < "$LS_TRANSCRIPT" | tr -d ' ')
-        print -P "  Transcript: ${C[bright_cyan]}$LS_TRANSCRIPT${C[reset]} ${C[dim]}($lines lines)${C[reset]}"
+
+    # Run AI titling on the just-finished session (no-op if llama.cpp + the
+    # tiny LLM aren't installed). title_session_file may rename the file and
+    # update the live.txt symlink target.
+    if [[ -L "$MK_TRANSCRIPT" ]]; then
+        local actual=$(readlink "$MK_TRANSCRIPT" 2>/dev/null)
+        [[ -n "$actual" && -f "$actual" ]] && title_session_file "$actual"
+    fi
+
+    if [[ -f "$MK_TRANSCRIPT" ]]; then
+        local lines=$(wc -l < "$MK_TRANSCRIPT" | tr -d ' ')
+        local final=$(readlink "$MK_TRANSCRIPT" 2>/dev/null)
+        [[ -z "$final" ]] && final="$MK_TRANSCRIPT"
+        print -P "  Transcript: ${C[bright_cyan]}${final/$HOME/~}${C[reset]} ${C[dim]}($lines lines)${C[reset]}"
     fi
 }
 
@@ -282,36 +548,73 @@ cmd_status() {
     if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
         local pid=$(cat "$PID_FILE")
         local lines=0
-        [[ -f "$LS_TRANSCRIPT" ]] && lines=$(wc -l < "$LS_TRANSCRIPT" | tr -d ' ')
+        [[ -f "$MK_TRANSCRIPT" ]] && lines=$(wc -l < "$MK_TRANSCRIPT" | tr -d ' ')
         print -P "${C[green]}● recording${C[reset]} (PID $pid)"
-        print -P "  Transcript: ${C[dim]}$LS_TRANSCRIPT${C[reset]} ${C[dim]}($lines lines)${C[reset]}"
+        print -P "  Transcript: ${C[dim]}$MK_TRANSCRIPT${C[reset]} ${C[dim]}($lines lines)${C[reset]}"
     else
         rm -f "$PID_FILE" 2>/dev/null
         print -P "${C[dim]}○ not recording${C[reset]}"
-        if [[ -f "$LS_TRANSCRIPT" ]]; then
-            print -P "  Last transcript: ${C[dim]}$LS_TRANSCRIPT${C[reset]}"
+        if [[ -f "$MK_TRANSCRIPT" ]]; then
+            print -P "  Last transcript: ${C[dim]}$MK_TRANSCRIPT${C[reset]}"
         fi
+    fi
+    print -P ""
+    print -P "  ${C[bold]}Model:${C[reset]}     ${C[cyan]}$(model_active)${C[reset]}"
+    print -P "  ${C[bold]}Folder:${C[reset]}    ${C[dim]}${MK_TRANSCRIPTS_DIR/$HOME/~}${C[reset]}"
+
+    # Speaker-ID
+    print -nP "  ${C[bold]}Speakers:${C[reset]}  "
+    if ! diarize_available; then
+        print -P "${C[dim]}not installed${C[reset]} ${C[dim]}(/diarize install)${C[reset]}"
+    elif [[ "$(diarize_enabled_get)" == "false" ]]; then
+        print -P "${C[dim]}off${C[reset]} ${C[dim]}(/diarize on)${C[reset]}"
+    elif diarize_running; then
+        local n=0
+        if [[ -d "$MK_HOME/profiles" ]]; then
+            # null_glob locally so missing .npz files don't error.
+            setopt local_options null_glob
+            local files=("$MK_HOME/profiles"/*.npz)
+            n=${#files[@]}
+        fi
+        local plural=""
+        (( n != 1 )) && plural="s"
+        print -P "${C[green]}● running${C[reset]} ${C[dim]}($n profile$plural enrolled)${C[reset]}"
+    elif [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        # Recording active but server hasn't bound yet — transient.
+        print -P "${C[yellow]}starting${C[reset]}"
+    else
+        print -P "${C[cyan]}ready${C[reset]} ${C[dim]}(starts on /start)${C[reset]}"
+    fi
+
+    # AI titling
+    print -nP "  ${C[bold]}Titling:${C[reset]}   "
+    if llm_available; then
+        print -P "${C[green]}● ready${C[reset]} ${C[dim]}(Qwen3-0.6B)${C[reset]}"
+    else
+        print -P "${C[dim]}off${C[reset]} ${C[dim]}(/llm install)${C[reset]}"
     fi
 }
 
 # --- Tail command ---
+# Open (or raise) a separate Terminal.app window tailing the live transcript.
+# The meetink REPL stays in the foreground so /stop is still reachable —
+# tailing inline would block the REPL until Ctrl+C.
 cmd_tail() {
-    if [[ ! -f "$LS_TRANSCRIPT" ]]; then
-        print -P "${C[red]}error:${C[reset]} no transcript at $LS_TRANSCRIPT"
+    if [[ ! -f "$MK_TRANSCRIPT" ]]; then
+        print -P "${C[red]}error:${C[reset]} no transcript at $MK_TRANSCRIPT"
+        print -P "  ${C[dim]}Run${C[reset]} ${C[bright_cyan]}/start${C[reset]} ${C[dim]}first.${C[reset]}"
         exit 1
     fi
-    print -P "${C[dim]}Following $LS_TRANSCRIPT (Ctrl+C to stop)${C[reset]}"
-    print -P ""
-    tail -f "$LS_TRANSCRIPT"
+    window_open_tail "$MK_TRANSCRIPT"
 }
 
 # --- Help ---
 cmd_help() {
     print -P ""
-    print -P "${C[bold]}local-speech${C[reset]} ${C[dim]}v${LOCAL_SPEECH_VERSION}${C[reset]} — local-first meeting transcription"
+    print -P "${C[bold]}meetink${C[reset]} ${C[dim]}v${MEETINK_VERSION}${C[reset]} — local-first meeting transcription"
     print -P ""
     print -P "${C[bright_yellow]}USAGE${C[reset]}"
-    print -P "  local-speech [command]"
+    print -P "  meetink [command]"
     print -P ""
     print -P "${C[bright_yellow]}COMMANDS${C[reset]}"
     bullet "setup    " "install dependencies + download model"
@@ -322,33 +625,72 @@ cmd_help() {
     bullet "help     " "show this help"
     print -P ""
     print -P "${C[bright_yellow]}OUTPUT${C[reset]}"
-    print -P "  Transcripts:  ${C[dim]}$LS_HOME/transcripts/live.txt${C[reset]}"
-    print -P "  Prompts:      ${C[dim]}$LS_HOME/prompts/default.txt${C[reset]} ${C[dim]}(edit to customize whisper context)${C[reset]}"
-    print -P "  Models:       ${C[dim]}$LS_HOME/models/${C[reset]}"
+    print -P "  Transcripts:  ${C[dim]}${MK_TRANSCRIPTS_DIR/$HOME/~}/${C[reset]} ${C[dim]}(timestamped per session, live.txt symlinks to current)${C[reset]}"
+    print -P "  Prompts:      ${C[dim]}$MK_HOME/prompts/default.txt${C[reset]} ${C[dim]}(edit to customize whisper context)${C[reset]}"
+    print -P "  Models:       ${C[dim]}$MK_HOME/models/${C[reset]}"
     print -P ""
     print -P "${C[bright_yellow]}ENV OVERRIDES${C[reset]}"
-    print -P "  ${C[dim]}LOCAL_SPEECH_HOME${C[reset]}        custom data directory"
-    print -P "  ${C[dim]}LOCAL_SPEECH_MODEL${C[reset]}       custom whisper model path"
-    print -P "  ${C[dim]}LOCAL_SPEECH_TRANSCRIPT${C[reset]}  custom transcript path"
-    print -P "  ${C[dim]}LOCAL_SPEECH_PROMPT${C[reset]}      custom prompt path"
+    print -P "  ${C[dim]}MEETINK_HOME${C[reset]}             custom data (internal) directory"
+    print -P "  ${C[dim]}MEETINK_TRANSCRIPTS_DIR${C[reset]}  custom directory for transcripts"
+    print -P "  ${C[dim]}MEETINK_MODEL${C[reset]}            custom whisper model path"
+    print -P "  ${C[dim]}MEETINK_TRANSCRIPT${C[reset]}       custom live-symlink path"
+    print -P "  ${C[dim]}MEETINK_PROMPT${C[reset]}           custom prompt path"
     print -P ""
-    print -P "${C[dim]}https://github.com/sservaes/local-speech${C[reset]}"
+    print -P "${C[dim]}https://github.com/sservaes/meetink${C[reset]}"
     print -P ""
 }
 
 # --- Dispatch ---
-case "${1:-welcome}" in
-    welcome|"")        welcome_screen ;;
+# One-time legacy rename migration runs before any subcommand.
+migrate_legacy_install
+
+case "${1:-}" in
+    "")
+        # Bare invocation: launch the Python REPL on a TTY, fall back to the
+        # welcome screen (so piped/script callers still get something useful).
+        if [[ -t 0 && -t 1 ]]; then
+            launch_python_repl
+        else
+            welcome_screen
+        fi
+        ;;
+    welcome)           welcome_screen ;;
     setup)             cmd_setup ;;
     start)             shift; cmd_start "$@" ;;
     stop)              cmd_stop ;;
     status)            cmd_status ;;
     tail|follow)       cmd_tail ;;
     help|--help|-h)    cmd_help ;;
-    version|--version|-v) print "local-speech v$LOCAL_SPEECH_VERSION" ;;
+    # Slash commands invoked from the Python REPL map to their bare-name
+    # subcommands here. Most are already wired above (start/stop/status/etc);
+    # the rest dispatch to the existing cmd_* / cmd_X helpers.
+    model)             shift; cmd_model "$@" ;;
+    llm)               shift; cmd_llm "$@" ;;
+    diarize)           shift; cmd_diarize "$@" ;;
+    profile|profiles)  shift; cmd_profile "$@" ;;
+    project|projects)  shift; cmd_project "$@" ;;
+    me)                shift; cmd_me "$@" ;;
+    ask)               shift; cmd_ask "$@" ;;
+    context)           shift; cmd_context "$@" ;;
+    prompt|vocab)
+        mkdir -p "${MK_PROMPT:h}"
+        [[ -f "$MK_PROMPT" ]] || touch "$MK_PROMPT"
+        open -t "$MK_PROMPT"
+        print -P "  ${C[dim]}Opened${C[reset]} ${C[bright_cyan]}$MK_PROMPT${C[reset]}"
+        ;;
+    transcripts|ls)
+        if [[ ! -d "$MK_TRANSCRIPTS_DIR" ]] || [[ -z "$(ls -A "$MK_TRANSCRIPTS_DIR" 2>/dev/null)" ]]; then
+            print -P "${C[dim]}No transcripts in ${MK_TRANSCRIPTS_DIR/$HOME/~}${C[reset]}"
+        else
+            print -P "${C[dim]}${MK_TRANSCRIPTS_DIR/$HOME/~}/${C[reset]}"
+            ls -lhT "$MK_TRANSCRIPTS_DIR" 2>/dev/null || ls -lh "$MK_TRANSCRIPTS_DIR"
+        fi
+        ;;
+    _migrate)          migrate_transcripts ;;
+    version|--version|-v) print "meetink v$MEETINK_VERSION" ;;
     *)
         print -P "${C[red]}unknown command:${C[reset]} $1"
-        print -P "Run ${C[bright_cyan]}local-speech help${C[reset]} for available commands."
+        print -P "Run ${C[bright_cyan]}meetink help${C[reset]} for available commands."
         exit 1
         ;;
 esac

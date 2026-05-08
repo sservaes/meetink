@@ -1,6 +1,6 @@
 #!/bin/zsh
 # UI helpers — colors, ASCII art, boxes
-# Sourced by bin/local-speech
+# Sourced by bin/meetink
 
 # Colors
 typeset -gA C
@@ -20,13 +20,16 @@ C[bright_cyan]=$'\033[96m'
 C[bright_magenta]=$'\033[95m'
 C[bright_yellow]=$'\033[93m'
 
-# Disable colors if not a TTY or NO_COLOR is set
-if [[ ! -t 1 ]] || [[ -n "$NO_COLOR" ]]; then
+# Disable colors if NO_COLOR is set, or if stdout isn't a TTY *and* the
+# caller hasn't explicitly forced colors via MK_FORCE_COLOR. The Python
+# REPL sets MK_FORCE_COLOR=1 so subprocess output keeps its escape codes,
+# which we then render via the ANSI lexer in repl.py.
+if [[ -n "$NO_COLOR" ]] || ([[ ! -t 1 ]] && [[ -z "$MK_FORCE_COLOR" ]]); then
     for k in ${(k)C}; do C[$k]=""; done
 fi
 
-# Block-letter logo for "local-speech"
-ls_logo() {
+# Block-letter logo for "meetink"
+mk_logo() {
     print -P "${C[bright_cyan]}    █     ███   ███ █████ █     █████ ████ █████ █████ ███ █   █${C[reset]}"
     print -P "${C[bright_cyan]}    █    █   █ █    █   █ █     █     █  █ █     █     █   █   █${C[reset]}"
     print -P "${C[bright_cyan]}    █    █   █ █    █████ █     █████ ████ █████ █████ █   █████${C[reset]}"
@@ -35,7 +38,7 @@ ls_logo() {
 }
 
 # Smaller mark: "Ls~"
-ls_mark() {
+mk_mark() {
     print -P "${C[bright_cyan]}╭─────╮${C[reset]}"
     print -P "${C[bright_cyan]}│${C[reset]} ${C[bold]}Ls${C[reset]}${C[dim]}~${C[reset]}${C[bright_cyan]} │${C[reset]}"
     print -P "${C[bright_cyan]}╰─────╯${C[reset]}"
