@@ -498,17 +498,26 @@ stop_whisper_server() {
 
 # --- Start command ---
 cmd_start() {
-    # Optional trailing args = whitelist of enrolled profiles for *this*
-    # session (e.g. `/start alex stacey florin`). Tolerates a leading
-    # "with" or "whitelist" keyword as a readability nicety. Skipped
-    # when no args are passed — manual /diarize whitelist remains in
-    # effect, /watch can set it per-meeting from calendar attendees.
+    # Resolve the whitelist for *this* recording. Three sources, in
+    # priority order:
+    #   1. Trailing positional args (e.g. `/start alex stacey florin`)
+    #      with an optional "with"/"whitelist" prefix for readability.
+    #   2. MEETINK_WHITELIST env var (CSV). /watch sets this from the
+    #      calendar event's attendees so the watcher's flow goes
+    #      through the same code path as manual.
+    #   3. Neither set → empty list, which signals "clear" below.
+    #
+    # No source = clear. This was the foot-gun: a stale whitelist from
+    # the previous meeting was silently inherited, mis-restricting the
+    # next /start. Now /start always reaches a definite state.
     local -a whitelist
     if (( $# > 0 )); then
         if [[ "$1" == "with" || "$1" == "whitelist" ]]; then
             shift
         fi
         whitelist=("$@")
+    elif [[ -n "$MEETINK_WHITELIST" ]]; then
+        whitelist=(${(s:,:)MEETINK_WHITELIST})
     fi
 
     if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
@@ -549,9 +558,10 @@ cmd_start() {
     # silently skipped if the server isn't up.
     curl -s -o /dev/null -X POST "http://127.0.0.1:$MK_DIARIZE_PORT/session/clear" 2>/dev/null || true
 
-    # Apply per-session profile whitelist if /start got attendee names.
-    # Restricts /identify to those profiles only — voices that resemble
-    # any other profile fall through to clustering (THEM-X). Best-effort.
+    # Apply per-session profile whitelist. With names → restrict
+    # /identify to that set; without → clear any stale whitelist from
+    # a previous recording. Always reaches a definite state so the
+    # next /identify call hits exactly what the user expects.
     if (( ${#whitelist[@]} > 0 )); then
         local joined="${(j:,:)whitelist}"
         local resp=$(curl -s -X POST "http://127.0.0.1:$MK_DIARIZE_PORT/session/whitelist?profiles=$joined" 2>/dev/null)
@@ -559,6 +569,8 @@ cmd_start() {
         local unknown=$(print -- "$resp" | sed -nE 's/.*"unknown":[[:space:]]*\[([^]]*)\].*/\1/p' | sed 's/"//g; s/, */, /g')
         [[ -n "$applied" ]] && print -P "  ${C[dim]}Whitelist:${C[reset]} ${C[bright_cyan]}${applied}${C[reset]}"
         [[ -n "$unknown" ]] && print -P "  ${C[yellow]}⚠${C[reset]}  ${C[dim]}unknown (ignored):${C[reset]} ${unknown} ${C[dim]}— enrol via /profile add${C[reset]}"
+    else
+        curl -s -X POST "http://127.0.0.1:$MK_DIARIZE_PORT/session/whitelist?clear=true" >/dev/null 2>&1 || true
     fi
 
     MEETINK_MODEL="$MK_MODEL" \

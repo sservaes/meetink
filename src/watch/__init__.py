@@ -671,26 +671,27 @@ class WatchManager:
             )
 
         # Restrict /identify to enrolled profiles whose names match the
-        # attendee list. Eliminates the failure mode where Mike's voice
-        # scores 0.89 against ALEX in a meeting Alex isn't even in.
-        # Falls through to "match all" when no enrolled attendees are
-        # found (better than silently mis-restricting on bad signal).
+        # attendee list. Passed via MEETINK_WHITELIST so cmd_start sees
+        # the same source of truth as `/start alex stacey` — empty env
+        # var means cmd_start clears any stale whitelist for a clean
+        # slate. Eliminates the failure mode where Mike's voice scores
+        # 0.89 against ALEX in a meeting Alex isn't even in.
         matched = _match_attendees_to_profiles(chosen.attendees)
-        if _apply_whitelist(matched if matched else None):
-            if matched:
-                print(
-                    f"[watch] whitelist → {matched} "
-                    f"(matched from {chosen.title!r})",
-                    file=sys.stderr,
-                )
-            else:
-                print(
-                    f"[watch] whitelist cleared "
-                    f"(no enrolled attendees in {chosen.title!r})",
-                    file=sys.stderr,
-                )
-
         env_extras = self._metadata_env(chosen)
+        env_extras["MEETINK_WHITELIST"] = ",".join(matched)
+        if matched:
+            print(
+                f"[watch] whitelist → {matched} "
+                f"(matched from {chosen.title!r})",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"[watch] whitelist cleared "
+                f"(no enrolled attendees in {chosen.title!r})",
+                file=sys.stderr,
+            )
+
         ok = _start_recording_subprocess(env_extras)
         with self._lock:
             if ok:
@@ -856,12 +857,12 @@ class WatchManager:
                     self._instant_pending = False
                     return
 
-            # Clear any stale whitelist from a previous scheduled
-            # meeting — instant meetings have no attendee signal, so
-            # any subset would be wrong. Match-all is the safe default.
-            _apply_whitelist(None)
-
+            # Instant meetings have no attendee signal — explicitly
+            # pass an empty whitelist so cmd_start clears any stale
+            # one from the previous scheduled meeting (match-all is
+            # the safe default for impromptu calls).
             env_extras = self._instant_metadata_env(ev)
+            env_extras["MEETINK_WHITELIST"] = ""
             ok = _start_recording_subprocess(env_extras)
             with self._lock:
                 if ok:
