@@ -1,34 +1,6 @@
-```
-╭─ meetink v0.1.0 ─────────────────────────────────────────────────────────────────────────────────────────────╮
-│                                                                                                              │
-│   ███╗   ███╗███████╗███████╗████████╗██╗███╗   ██╗██╗  ██╗                                                  │
-│   ████╗ ████║██╔════╝██╔════╝╚══██╔══╝██║████╗  ██║██║ ██╔╝                                                  │
-│   ██╔████╔██║█████╗  █████╗     ██║   ██║██╔██╗ ██║█████╔╝                                                   │
-│   ██║╚██╔╝██║██╔══╝  ██╔══╝     ██║   ██║██║╚██╗██║██╔═██╗                                                   │
-│   ██║ ╚═╝ ██║███████╗███████╗   ██║   ██║██║ ╚████║██║  ██╗                                                  │
-│   ╚═╝     ╚═╝╚══════╝╚══════╝   ╚═╝   ╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝                                                  │
-│                                                                                                              │
-│   Hi Stijn — every meeting, inked locally.                                                                   │
-│                                                                                                              │
-│   Tips for getting started                         Status                                                    │
-│   • All set. Dependencies installed.               ● capture binary    ● whisper model    ● whisper-cpp      │
-│   • Type `/start`  to begin transcribing                                                                     │
-│   • Type `/help`   for all commands                ● speaker ID        ● Sonnet titling                      │
-│                                                                                                              │
-╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
-
-  Made for macOS · Apple Silicon optimized · ~/.meetink
-
-
-Type /help for commands. Tab to autocomplete.
-Tip: Group meetings with /project use acme — recordings, summaries, /ask all scope to it.
-
-meetink ○ >
-
-
-🎙 small.en │ 📁 ~/Documents/meetink/uk-aisi │ 📦 uk-aisi │ 👤 5 profiles │ ✨ Sonnet │ 📚 ready │ 🧠 16GB · 4.8GB free
-○ idle │ context ▱▱▱▱▱▱▱▱ 2% 200K │ /start to record · /help for commands
-```
+<p align="center">
+  <img src="docs/images/banner.png" alt="meetink — local-first meeting transcription for macOS" width="100%">
+</p>
 
 # meetink
 
