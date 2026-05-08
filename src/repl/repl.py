@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1266,7 +1267,15 @@ def handle_command(line: str) -> bool:
         emit("\033[2mcommands start with / — try /help\033[0m")
         return True
 
-    parts = line.split()
+    # shlex so paths with backslash-escaped or quoted spaces survive intact:
+    # `/context add /Users/x/Mobile\ Documents/foo.md` → args=["add", "/Users/.../foo.md"]
+    # `/context add "/Users/x/Mobile Documents/foo.md"` → same
+    # Falls back to whitespace split on unclosed quotes (e.g. /ask's "what's"
+    # apostrophe), which is fine because /ask rejoins with " ".
+    try:
+        parts = shlex.split(line, posix=True)
+    except ValueError:
+        parts = line.split()
     cmd = parts[0]
     args = parts[1:]
 
