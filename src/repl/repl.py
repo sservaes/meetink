@@ -949,14 +949,14 @@ HELP_TEXT = """\033[93mCOMMANDS\033[0m
   \033[1m/transcripts\033[0m  \033[2mlist past transcripts\033[0m
   \033[1m/model\033[0m        \033[2mlist/switch/download whisper models\033[0m
   \033[1m/llm\033[0m          \033[2minstall/remove the AI-titling LLM\033[0m
-  \033[1m/diarize\033[0m      \033[2mspeaker-ID sidecar (/diarize on|off|install|rm)\033[0m
-  \033[1m/profile\033[0m      \033[2menroll voices: /profile add <name> | list | train | rm\033[0m
+  \033[1m/diarize\033[0m      \033[2mspeaker-ID sidecar (/diarize on|off|install|rm|sensitivity|whitelist|auto-train)\033[0m
+  \033[1m/profile\033[0m      \033[2menroll/manage voices: /profile add|train|undo|rm|rename|assign|merge|clusters\033[0m
   \033[1m/project\033[0m      \033[2mscope recordings to a project: /project use <name> | list | clear\033[0m
   \033[1m/me\033[0m            \033[2mset your name: /me Stijn → mic stream labelled STIJN: in transcripts\033[0m
   \033[1m/ask\033[0m           \033[2mask the AI about the current/latest transcript: /ask what did we decide?\033[0m
   \033[1m/context\033[0m       \033[2mattach docs to a project: /context add report.pdf | list | rm | show\033[0m
   \033[1m/index\033[0m         \033[2mRAG sidecar for /ask on long meetings: /index install | status | rm\033[0m
-  \033[1m/watch\033[0m         \033[2mauto-record from calendar (phase 1: /watch events | notify | detect)\033[0m
+  \033[1m/watch\033[0m         \033[2mauto-record from calendar + impromptu calls: /watch on|off|status|skip|events|notify|detect\033[0m
   \033[1m/setup\033[0m        \033[2minstall dependencies + download whisper model\033[0m
   \033[1m/clear\033[0m        \033[2mclear scrollback\033[0m
   \033[1m/help\033[0m         \033[2mthis list\033[0m

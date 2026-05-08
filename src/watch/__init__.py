@@ -281,26 +281,6 @@ def _match_attendees_to_profiles(attendees: list) -> list[str]:
     return [p for p in profile_names if p.lower() in haystack]
 
 
-def _apply_whitelist(names: "list[str] | None") -> bool:
-    """POST the whitelist to the diarize-server. None or [] clears it."""
-    try:
-        import urllib.request
-        port = int(os.environ.get("MEETINK_DIARIZE_PORT", "8179"))
-        if not names:
-            url = f"http://127.0.0.1:{port}/session/whitelist?clear=true"
-        else:
-            url = (
-                f"http://127.0.0.1:{port}/session/whitelist"
-                f"?profiles={','.join(names)}"
-            )
-        urllib.request.urlopen(
-            urllib.request.Request(url, method="POST"), timeout=2,
-        ).read()
-        return True
-    except Exception:
-        return False
-
-
 # ---------------------------------------------------------------------------
 # Launcher dispatch (re-uses cmd_start / cmd_stop / cmd_project)
 # ---------------------------------------------------------------------------

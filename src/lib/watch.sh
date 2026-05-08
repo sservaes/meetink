@@ -1,22 +1,23 @@
 #!/bin/zsh
-# /watch — auto-record meetings from your calendar.
+# /watch — auto-record meetings from your calendar (and impromptu calls).
 #
-# This file ships in two phases. Today (phase 1) it exposes diagnostic
-# subcommands that wrap the meetink-agent app bundle so you can validate
-# calendar access, notifications, and meeting detection without leaving
-# the REPL:
+# Two surfaces:
+#
+# Long-running watcher (lifecycle commands live in src/repl/repl.py
+# because the watcher thread has to outlive a single subcommand):
+#
+#   /watch on        start the watcher; persists across REPL restarts
+#                    via watch_enabled in ~/.meetink/config
+#   /watch off       stop the watcher (does not stop an in-flight
+#                    recording)
+#   /watch status    state of the watcher + next event ETA
+#   /watch skip      mark the soonest pending event as skipped
+#
+# Diagnostics (one-shot, dispatched here):
 #
 #   /watch events    list upcoming events from Calendar.app
 #   /watch notify    send a test notification with action buttons
 #   /watch detect    show whether a video call is currently active
-#
-# Phase 2 (later) adds the long-running watcher:
-#
-#   /watch on        start the watcher; auto-records meetings until
-#                    /watch off
-#   /watch off       stop the watcher (does not stop an in-flight
-#                    recording)
-#   /watch status    state of the watcher + next event ETA
 #
 # Sourced by bin/meetink AFTER index.sh, repl.sh.
 
@@ -176,14 +177,16 @@ cmd_watch() {
             ;;
         ""|help)
             print -P ""
-            print -P "${C[bright_yellow]}/watch${C[reset]} ${C[dim]}— auto-record meetings from your calendar${C[reset]}"
+            print -P "${C[bright_yellow]}/watch${C[reset]} ${C[dim]}— auto-record meetings from your calendar (and impromptu calls)${C[reset]}"
             print -P ""
-            print -P "  ${C[bright_cyan]}/watch events${C[reset]} ${C[dim]}[hours]${C[reset]}    list upcoming calendar events"
-            print -P "  ${C[bright_cyan]}/watch notify${C[reset]}            send a test notification (Skip/Continue)"
-            print -P "  ${C[bright_cyan]}/watch detect${C[reset]}            check if a video call is active right now"
+            print -P "  ${C[bright_cyan]}/watch on${C[reset]}                start the auto-recorder ${C[dim]}(persists across REPL restarts)${C[reset]}"
+            print -P "  ${C[bright_cyan]}/watch off${C[reset]}               stop the auto-recorder"
+            print -P "  ${C[bright_cyan]}/watch status${C[reset]}            running state, current recording, upcoming events"
+            print -P "  ${C[bright_cyan]}/watch skip${C[reset]}              mark the soonest pending event as skipped"
             print -P ""
-            print -P "  ${C[dim]}/watch on${C[reset]} ${C[dim]}— phase 2 (start the auto-recorder)${C[reset]}"
-            print -P "  ${C[dim]}/watch off${C[reset]} ${C[dim]}— phase 2 (stop the auto-recorder)${C[reset]}"
+            print -P "  ${C[bright_cyan]}/watch events${C[reset]} ${C[dim]}[hours]${C[reset]}    list upcoming calendar events ${C[dim]}(diagnostic)${C[reset]}"
+            print -P "  ${C[bright_cyan]}/watch notify${C[reset]}            send a test notification ${C[dim]}(diagnostic)${C[reset]}"
+            print -P "  ${C[bright_cyan]}/watch detect${C[reset]}            check if a video call is active right now ${C[dim]}(diagnostic)${C[reset]}"
             print -P ""
             ;;
         *)
