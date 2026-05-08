@@ -410,25 +410,123 @@ def _footer_top_raw() -> str:
     return FOOTER_SEP.join(parts)
 
 
+# Per-segment gradient for the context bar — green → yellow as fill grows.
+# 256-color escapes; degrades gracefully on terminals that don't honour the
+# specific colour (they'll fall back to the closest 16-colour match).
+_CTX_BAR_GRADIENT = (
+    "\033[38;5;46m",   # bright green
+    "\033[38;5;82m",
+    "\033[38;5;118m",
+    "\033[38;5;154m",
+    "\033[38;5;190m",
+    "\033[38;5;226m",  # yellow
+    "\033[38;5;220m",
+    "\033[38;5;208m",  # orange
+)
+_CTX_BAR_SEGMENTS = len(_CTX_BAR_GRADIENT)
+_CTX_BAR_DIM = "\033[38;5;238m"
+
+# Cached chip — recomputed at most every 2s so the 1s footer tick doesn't
+# stat the transcript file on every keystroke / blink.
+_ctx_bar_cache: dict = {"text": "", "ts": 0.0}
+
+
+def _active_local_llm_key() -> str:
+    """Read local_llm_model= from the config, fall back to the default."""
+    cfg = MK_HOME / "config"
+    if cfg.exists():
+        try:
+            for line in cfg.read_text().splitlines():
+                if line.startswith("local_llm_model="):
+                    val = line.split("=", 1)[1].strip()
+                    if val:
+                        return val
+        except OSError:
+            pass
+    return "qwen3.5-2b"
+
+
+def _context_bar() -> str:
+    """Render a 'context ▰▰▰▱▱▱▱▱ 38% 16K' chip showing how full the active
+    local model's token budget is for the next /ask. Hidden when backend is
+    claude (200K+ window — chip would always be a sliver). Uses a chars/4
+    estimate so the footer doesn't pay tokenizer cost on every tick."""
+    if _title_backend() != "local":
+        return ""
+
+    now = time.time()
+    if _ctx_bar_cache["text"] and now - _ctx_bar_cache["ts"] < 2.0:
+        return _ctx_bar_cache["text"]
+
+    budget = _ask_budget_for(_active_local_llm_key())
+    # Match _try_handle_ask_local: 600 tokens reserved for response + safety.
+    effective = max(1, budget - 600)
+
+    # Cheap chars/4 estimate. Transcript dominates everything else in
+    # practice; ask_history is the next most variable contributor.
+    used = 0
+    tx = _ask_transcript_path()
+    if tx is not None:
+        try:
+            used += tx.stat().st_size // 4
+        except OSError:
+            pass
+    try:
+        from llm.mlx_runtime import get_runtime  # type: ignore[import-not-found]
+        used += len(get_runtime().ask_history_text()) // 4
+    except Exception:
+        pass
+
+    pct = min(100, int(round(100 * used / effective)))
+    filled = max(0, min(_CTX_BAR_SEGMENTS, int(round(_CTX_BAR_SEGMENTS * pct / 100))))
+
+    if pct < 60:
+        pct_colour = "\033[38;5;82m"
+    elif pct < 85:
+        pct_colour = "\033[38;5;226m"
+    else:
+        pct_colour = "\033[38;5;196m"
+
+    bar = ""
+    for i in range(_CTX_BAR_SEGMENTS):
+        if i < filled:
+            bar += f"{_CTX_BAR_GRADIENT[i]}▰\033[0m"
+        else:
+            bar += f"{_CTX_BAR_DIM}▱\033[0m"
+
+    budget_label = f"{budget // 1000}K" if budget >= 1000 else str(budget)
+    text = (
+        f"\033[90mcontext\033[0m {bar} "
+        f"{pct_colour}{pct}%\033[0m \033[90m{budget_label}\033[0m"
+    )
+    _ctx_bar_cache["text"] = text
+    _ctx_bar_cache["ts"] = now
+    return text
+
+
 def _footer_bottom_raw() -> str:
-    """Runtime state: recording status + transcript progress, with a hint on
-    the right when idle."""
+    """Runtime state: recording status + transcript progress + context bar,
+    with a hint on the right when idle."""
+    parts: list[str] = []
     if is_running():
         start = recording_start()
         elapsed = int(time.time() - start) if start else 0
         time_str = f"{elapsed // 60:02d}:{elapsed % 60:02d}"
+        parts.append(f"\033[32m● recording {time_str}\033[0m")
         n = line_count(MK_TRANSCRIPT)
         if n > 0:
-            return (
-                f"\033[32m● recording {time_str}\033[0m"
-                f"{FOOTER_SEP}\033[90m{n} lines\033[0m"
-            )
-        return f"\033[32m● recording {time_str}\033[0m"
-    return (
-        "\033[90m○ idle\033[0m"
-        f"{FOOTER_SEP}"
-        "\033[2m/start to record · /help for commands\033[0m"
-    )
+            parts.append(f"\033[90m{n} lines\033[0m")
+    else:
+        parts.append("\033[90m○ idle\033[0m")
+
+    bar = _context_bar()
+    if bar:
+        parts.append(bar)
+
+    if not is_running():
+        parts.append("\033[2m/start to record · /help for commands\033[0m")
+
+    return FOOTER_SEP.join(parts)
 
 
 def bottom_toolbar():
