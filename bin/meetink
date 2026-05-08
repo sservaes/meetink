@@ -588,8 +588,12 @@ cmd_start() {
 
     # Auto-open a separate Terminal window tailing the live transcript so
     # the user can keep the meetink REPL in front for /stop while the
-    # transcript scrolls in its own window.
-    window_open_tail "$MK_TRANSCRIPT"
+    # transcript scrolls in its own window. Skipped when MEETINK_NO_TAIL
+    # is set (e.g. /watch-driven auto-records — the user is in the
+    # meeting, not at the desk, so a popping tail window is intrusive).
+    if [[ -z "$MEETINK_NO_TAIL" ]]; then
+        window_open_tail "$MK_TRANSCRIPT"
+    fi
 }
 
 # --- Stop command ---

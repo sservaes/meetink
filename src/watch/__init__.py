@@ -316,7 +316,10 @@ def _project_use(name: str) -> None:
 
 
 def _start_recording_subprocess(env_extras: dict[str, str]) -> bool:
-    env = {**os.environ, **env_extras}
+    # /watch is an unattended path — the user is likely in the meeting,
+    # not at the REPL. Suppress the auto-tail window that manual /start
+    # opens; the live transcript is one /watch tail away if they want it.
+    env = {**os.environ, "MEETINK_NO_TAIL": "1", **env_extras}
     proc = subprocess.run(
         [str(LAUNCHER), "start"],
         check=False, capture_output=True, env=env, text=True,
