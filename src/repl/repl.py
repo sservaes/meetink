@@ -885,6 +885,9 @@ _NESTED_COMMANDS = {
         "off": None,
         "start": None,
         "stop": None,
+        "sensitivity": WordCompleter(
+            ["focused", "default", "strict"], ignore_case=True,
+        ),
     },
     "/profile": {
         "add": None,
@@ -894,6 +897,7 @@ _NESTED_COMMANDS = {
         "clusters": None,
         "assign": None,
         "merge": None,
+        "rename": _profile_names_completer,
     },
     "/project": {
         "list": None,

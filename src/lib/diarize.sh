@@ -228,6 +228,60 @@ except Exception:
     print ""
 }
 
+# /diarize sensitivity — view or set the matching aggressiveness preset.
+# Hot-applies via POST /session/sensitivity so a switch mid-meeting takes
+# effect on the very next ~10 s identification window. No restart needed.
+diarize_sensitivity() {
+    local mode="$1"
+    if ! diarize_running; then
+        print -P "${C[red]}error:${C[reset]} diarize-server not running"
+        return 1
+    fi
+    if [[ -z "$mode" ]]; then
+        # Show current
+        local resp=$(curl -sf "http://127.0.0.1:$MK_DIARIZE_PORT/session/sensitivity")
+        if [[ -z "$resp" ]]; then
+            print -P "${C[red]}error:${C[reset]} no response from diarize-server"
+            return 1
+        fi
+        local cur=$(print -- "$resp" | sed -nE 's/.*"preset":[[:space:]]*"([^"]+)".*/\1/p')
+        local thr=$(print -- "$resp" | sed -nE 's/.*"threshold":[[:space:]]*([0-9.]+).*/\1/p')
+        local mar=$(print -- "$resp" | sed -nE 's/.*"margin":[[:space:]]*([0-9.]+).*/\1/p')
+        local clt=$(print -- "$resp" | sed -nE 's/.*"cluster_threshold":[[:space:]]*([0-9.]+).*/\1/p')
+        print -P ""
+        print -P "${C[bright_yellow]}SENSITIVITY${C[reset]}"
+        print -P "  ${C[dim]}preset:${C[reset]}             ${C[bold]}${cur}${C[reset]}"
+        print -P "  ${C[dim]}threshold:${C[reset]}          ${thr}   ${C[dim]}cosine ≥ this to claim a profile match${C[reset]}"
+        print -P "  ${C[dim]}margin:${C[reset]}             ${mar}   ${C[dim]}top profile must beat runner-up by this${C[reset]}"
+        print -P "  ${C[dim]}cluster_threshold:${C[reset]}  ${clt}   ${C[dim]}cosine ≥ this to merge into existing cluster${C[reset]}"
+        print -P ""
+        print -P "  ${C[dim]}/diarize sensitivity focused${C[reset]}   ${C[dim]}— 1:1s & small known-speaker meetings${C[reset]}"
+        print -P "  ${C[dim]}/diarize sensitivity default${C[reset]}   ${C[dim]}— general purpose (current ship default)${C[reset]}"
+        print -P "  ${C[dim]}/diarize sensitivity strict${C[reset]}    ${C[dim]}— large meetings, lots of unknown voices${C[reset]}"
+        print -P ""
+        return 0
+    fi
+
+    case "$mode" in
+        focused|default|strict) ;;
+        *)
+            print -P "${C[red]}error:${C[reset]} unknown mode '$mode'"
+            print -P "  ${C[dim]}available:${C[reset]} focused | default | strict"
+            return 1
+            ;;
+    esac
+    local resp=$(curl -s -X POST \
+        "http://127.0.0.1:$MK_DIARIZE_PORT/session/sensitivity?mode=$mode")
+    if ! _resp_ok "$resp"; then
+        print -P "${C[red]}error:${C[reset]} $resp"
+        return 1
+    fi
+    local thr=$(print -- "$resp" | sed -nE 's/.*"threshold":[[:space:]]*([0-9.]+).*/\1/p')
+    local mar=$(print -- "$resp" | sed -nE 's/.*"margin":[[:space:]]*([0-9.]+).*/\1/p')
+    local clt=$(print -- "$resp" | sed -nE 's/.*"cluster_threshold":[[:space:]]*([0-9.]+).*/\1/p')
+    print -P "${C[green]}✓${C[reset]} Sensitivity → ${C[bold]}${mode}${C[reset]} ${C[dim]}(threshold=${thr}, margin=${mar}, cluster_threshold=${clt})${C[reset]}"
+}
+
 cmd_diarize() {
     local sub="$1"
     case "$sub" in
@@ -251,9 +305,10 @@ cmd_diarize() {
             ;;
         start)             diarize_start ;;
         stop)              diarize_stop && print -P "${C[green]}✓${C[reset]} diarize-server stopped" ;;
+        sensitivity|sens)  diarize_sensitivity "$2" ;;
         *)
             print -P "${C[red]}unknown:${C[reset]} ${C[dim]}/diarize $sub${C[reset]}"
-            print -P "  ${C[dim]}/diarize${C[reset]} | ${C[dim]}/diarize on${C[reset]} | ${C[dim]}/diarize off${C[reset]} | ${C[dim]}/diarize install${C[reset]} | ${C[dim]}/diarize rm${C[reset]}"
+            print -P "  ${C[dim]}/diarize${C[reset]} | ${C[dim]}/diarize on${C[reset]} | ${C[dim]}/diarize off${C[reset]} | ${C[dim]}/diarize install${C[reset]} | ${C[dim]}/diarize rm${C[reset]} | ${C[dim]}/diarize sensitivity [mode]${C[reset]}"
             ;;
     esac
 }
@@ -470,6 +525,7 @@ except Exception:
     print -P ""
     print -P "  ${C[dim]}/profile assign <letter> <name>${C[reset]}   promote cluster → real profile"
     print -P "  ${C[dim]}/profile merge <from> <into>${C[reset]}      fold one cluster into another"
+    print -P "  ${C[dim]}/profile rename <old> <new>${C[reset]}       rename a profile (or fold into existing)"
     print -P ""
 }
 
@@ -503,6 +559,49 @@ profile_assign() {
     if [[ -L "$MK_TRANSCRIPT" ]] && _rewrite_transcript_label "$MK_TRANSCRIPT" "THEM-${up_letter}" "$up_name"; then
         local actual=$(readlink "$MK_TRANSCRIPT" 2>/dev/null)
         print -P "${C[green]}✓${C[reset]} Renamed ${C[dim]}THEM-${up_letter}${C[reset]} → ${C[bold]}${up_name}${C[reset]} in ${C[bright_cyan]}${actual:t}${C[reset]}"
+    fi
+}
+
+# Rename a profile, OR fold one profile into an existing other (when the
+# same speaker got enrolled under two names — e.g. earlier session called
+# them BOB, this one calls them FLAVIO). Server is the source of truth;
+# we mirror the change to the live transcript.
+profile_rename() {
+    local from="$1" to="$2"
+    if [[ -z "$from" || -z "$to" ]]; then
+        print -P "${C[red]}usage:${C[reset]} /profile rename <old> <new>"
+        return 1
+    fi
+    if [[ "$to" == *.* || "$to" == */* ]]; then
+        print -P "${C[red]}error:${C[reset]} no slashes or dots in names"
+        return 1
+    fi
+    if ! diarize_running; then
+        print -P "${C[red]}error:${C[reset]} diarize-server not running"
+        return 1
+    fi
+
+    local resp=$(curl -s -X POST \
+        "http://127.0.0.1:$MK_DIARIZE_PORT/session/rename?from=$from&to=$to")
+    if ! _resp_ok "$resp"; then
+        print -P "${C[red]}error:${C[reset]} $resp"
+        return 1
+    fi
+    local samples=$(print -- "$resp" | sed -nE 's/.*"samples":[[:space:]]*([0-9]+).*/\1/p')
+    local merged=$(print -- "$resp" | sed -nE 's/.*"merged":[[:space:]]*(true|false).*/\1/p')
+    if [[ "$merged" == "true" ]]; then
+        print -P "${C[green]}✓${C[reset]} Folded ${C[bold]}$from${C[reset]} into ${C[bold]}$to${C[reset]} ${C[dim]}($samples samples total)${C[reset]}"
+    else
+        print -P "${C[green]}✓${C[reset]} Renamed ${C[bold]}$from${C[reset]} → ${C[bold]}$to${C[reset]} ${C[dim]}($samples samples)${C[reset]}"
+    fi
+
+    # Live transcript labels are uppercase (main.swift uppercases names),
+    # so we rewrite BOB → FLAVIO not bob → flavio.
+    local up_from=$(print -n -- "$from" | tr '[:lower:]' '[:upper:]')
+    local up_to=$(print -n -- "$to" | tr '[:lower:]' '[:upper:]')
+    if [[ -L "$MK_TRANSCRIPT" ]] && _rewrite_transcript_label "$MK_TRANSCRIPT" "$up_from" "$up_to"; then
+        local actual=$(readlink "$MK_TRANSCRIPT" 2>/dev/null)
+        print -P "${C[green]}✓${C[reset]} Renamed ${C[dim]}${up_from}${C[reset]} → ${C[bold]}${up_to}${C[reset]} in ${C[bright_cyan]}${actual:t}${C[reset]}"
     fi
 }
 
@@ -546,6 +645,7 @@ cmd_profile() {
         clusters|cluster)      profile_clusters          ;;
         assign)                profile_assign  "$2" "$3" ;;
         merge)                 profile_merge   "$2" "$3" ;;
+        rename|mv)             profile_rename  "$2" "$3" ;;
         *)
             print -P "${C[red]}unknown:${C[reset]} ${C[dim]}/profile $sub${C[reset]}"
             print -P "  ${C[dim]}/profile add <name>${C[reset]}              enroll a new voice (3 samples)"

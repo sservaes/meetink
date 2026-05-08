@@ -45,6 +45,15 @@ POST   /session/clear                 reset clusters (called by /start)
 POST   /session/assign?cluster=A&name=Alice
                                       promote cluster A to a real profile
 POST   /session/merge?from=A&into=B   merge cluster A's samples into cluster B
+POST   /session/rename?from=bob&to=flavio
+                                      rename a profile, OR fold its samples
+                                      into an existing profile if `to` already
+                                      exists (used to fix split identities like
+                                      bob/flavio being the same person)
+GET    /session/sensitivity           current threshold/margin/cluster_threshold
+POST   /session/sensitivity?mode=focused|default|strict
+                                      apply a preset; takes effect on next
+                                      /identify, no restart required
 """
 
 from __future__ import annotations
@@ -62,12 +71,60 @@ MK_HOME = Path(os.environ.get("MEETINK_HOME", os.path.expanduser("~/.meetink")))
 MODEL_PATH = Path(os.environ.get("MEETINK_DIARIZE_MODEL", MK_HOME / "models" / "speaker-embedding.onnx"))
 PROFILES_DIR = Path(os.environ.get("MEETINK_PROFILES_DIR", MK_HOME / "profiles"))
 PORT = int(os.environ.get("MEETINK_DIARIZE_PORT", "8179"))
-THRESHOLD = float(os.environ.get("MEETINK_DIARIZE_THRESHOLD", "0.65"))
-MARGIN = float(os.environ.get("MEETINK_DIARIZE_MARGIN", "0.07"))
-# Higher than the profile-match THRESHOLD so we err on the side of *splitting*
-# clusters (under-merging) rather than fusing two distinct speakers — false
-# splits are easy to recover from with /profile merge, false merges aren't.
-CLUSTER_THRESHOLD = float(os.environ.get("MEETINK_DIARIZE_CLUSTER_THRESHOLD", "0.72"))
+
+# --- Sensitivity presets ----------------------------------------------------
+#
+# Three knobs control how the server hands out names:
+#   threshold         — cosine ≥ this is required to claim a profile match
+#   margin            — top profile must beat runner-up by ≥ this
+#   cluster_threshold — cosine ≥ this is required to join an existing cluster
+#
+# Different meetings want different bias. The presets below are sized
+# around the failure modes we've seen, not just nudges to the defaults.
+#
+# focused  — 1:1s and small meetings with familiar speakers.
+#            Wide MARGIN guards against bob-vs-flavio confusion when two
+#            enrolled profiles sit close in voice space (the common
+#            failure: Flavio scoring 0.66 against BOB and 0.62 against
+#            FLAVIO, false-naming as BOB). Low CLUSTER_THRESHOLD keeps
+#            an unmatched speaker as one cluster instead of splintering
+#            into THEM-A/THEM-B/THEM-C across the call.
+#
+# default  — what shipped before sensitivity was a runtime knob. Kept as
+#            a baseline for backwards compatibility, not because it's
+#            the universal best.
+#
+# strict   — large meetings with strangers. Higher THRESHOLD avoids
+#            misnaming an unknown speaker as someone enrolled. Higher
+#            CLUSTER_THRESHOLD preserves distinct voices as distinct
+#            clusters even when they're tonally similar.
+PRESETS: dict[str, dict[str, float]] = {
+    "focused": {"threshold": 0.62, "margin": 0.12, "cluster_threshold": 0.55},
+    "default": {"threshold": 0.65, "margin": 0.07, "cluster_threshold": 0.72},
+    "strict":  {"threshold": 0.70, "margin": 0.10, "cluster_threshold": 0.78},
+}
+
+# Live settings — every code path reads these via dict lookup so a POST
+# /session/sensitivity update takes effect on the very next /identify
+# without a server restart. Env-var overrides at boot still win on the
+# initial read; presets are applied on top of them when chosen.
+settings: dict[str, float] = {
+    "threshold": float(os.environ.get(
+        "MEETINK_DIARIZE_THRESHOLD",
+        str(PRESETS["default"]["threshold"]),
+    )),
+    "margin": float(os.environ.get(
+        "MEETINK_DIARIZE_MARGIN",
+        str(PRESETS["default"]["margin"]),
+    )),
+    "cluster_threshold": float(os.environ.get(
+        "MEETINK_DIARIZE_CLUSTER_THRESHOLD",
+        str(PRESETS["default"]["cluster_threshold"]),
+    )),
+}
+# Track which preset (if any) the user explicitly selected, so GET
+# /session/sensitivity can echo "focused" instead of always "custom".
+settings_preset: str = os.environ.get("MEETINK_DIARIZE_PRESET", "default")
 
 PROFILES_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -208,7 +265,10 @@ def identify(emb: np.ndarray) -> dict:
     top_name, top_sim = sims[0]
     second_name, second_sim = (sims[1] if len(sims) > 1 else (None, -1.0))
 
-    accepted = top_sim >= THRESHOLD and (top_sim - second_sim) >= MARGIN
+    accepted = (
+        top_sim >= settings["threshold"]
+        and (top_sim - second_sim) >= settings["margin"]
+    )
     return {
         "speaker": top_name if accepted else None,
         "confidence": round(top_sim, 3),
@@ -260,7 +320,7 @@ def _cluster_or_create(emb: np.ndarray) -> tuple[str, float]:
     if clusters:
         best = max(clusters, key=lambda c: cosine(emb, c["centroid"]))
         sim = cosine(emb, best["centroid"])
-        if sim >= CLUSTER_THRESHOLD:
+        if sim >= settings["cluster_threshold"]:
             new_samples = np.vstack([best["samples"], _l2(emb)[np.newaxis, :]])
             best["samples"] = new_samples
             best["centroid"] = _centroid(new_samples)
@@ -306,9 +366,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {
                 "status": "ok",
                 "profiles": list(profiles.keys()),
-                "threshold": THRESHOLD,
-                "margin": MARGIN,
-                "cluster_threshold": CLUSTER_THRESHOLD,
+                "threshold": settings["threshold"],
+                "margin": settings["margin"],
+                "cluster_threshold": settings["cluster_threshold"],
+                "preset": settings_preset,
                 "clusters": len(clusters),
             })
             return
@@ -318,6 +379,15 @@ class Handler(BaseHTTPRequestHandler):
                     {"name": n, "samples": int(p["samples"].shape[0])}
                     for n, p in profiles.items()
                 ]
+            })
+            return
+        if path == "/session/sensitivity":
+            self._json(200, {
+                "preset": settings_preset,
+                "threshold": settings["threshold"],
+                "margin": settings["margin"],
+                "cluster_threshold": settings["cluster_threshold"],
+                "available": list(PRESETS.keys()),
             })
             return
         if path == "/session/clusters":
@@ -420,6 +490,95 @@ class Handler(BaseHTTPRequestHandler):
                     "samples": count,
                 })
                 return
+            if url.path == "/session/sensitivity":
+                qs = parse_qs(url.query)
+                mode = (qs.get("mode", [""])[0]).strip().lower()
+                if not mode:
+                    self._json(400, {"error": "need ?mode=focused|default|strict"})
+                    return
+                if mode not in PRESETS:
+                    self._json(400, {
+                        "error": f"unknown mode '{mode}'",
+                        "available": list(PRESETS.keys()),
+                    })
+                    return
+                # Mutate in place so existing dict references stay live.
+                # Each consumer reads via dict lookup at call time, so
+                # the next /identify hits the new values immediately.
+                preset = PRESETS[mode]
+                settings["threshold"] = preset["threshold"]
+                settings["margin"] = preset["margin"]
+                settings["cluster_threshold"] = preset["cluster_threshold"]
+                global settings_preset
+                settings_preset = mode
+                print(
+                    f"sensitivity: preset={mode} "
+                    f"threshold={settings['threshold']} "
+                    f"margin={settings['margin']} "
+                    f"cluster_threshold={settings['cluster_threshold']}",
+                    file=sys.stderr,
+                )
+                self._json(200, {
+                    "ok": True,
+                    "preset": mode,
+                    "threshold": settings["threshold"],
+                    "margin": settings["margin"],
+                    "cluster_threshold": settings["cluster_threshold"],
+                })
+                return
+            if url.path == "/session/rename":
+                qs = parse_qs(url.query)
+                src_name = (qs.get("from", [""])[0]).strip()
+                dst_name = (qs.get("to", [""])[0]).strip()
+                if not src_name or not dst_name:
+                    self._json(400, {"error": "need ?from=alice&to=alex"})
+                    return
+                if src_name == dst_name:
+                    self._json(400, {"error": "from and to must differ"})
+                    return
+                if any(c in dst_name for c in "/\\.."):
+                    self._json(400, {"error": "invalid name (no slashes or dots)"})
+                    return
+                if src_name not in profiles:
+                    self._json(404, {"error": f"no profile named {src_name}"})
+                    return
+                src_samples = profiles[src_name]["samples"]
+                merged_into_existing = dst_name in profiles
+                if merged_into_existing:
+                    # Fold: vstack onto dst, recompute centroid. This is the
+                    # common case when the same person was enrolled twice
+                    # under different names (e.g. bob and flavio).
+                    combined = np.vstack(
+                        [profiles[dst_name]["samples"], src_samples]
+                    )
+                    profiles[dst_name] = {
+                        "centroid": _centroid(combined),
+                        "samples": combined,
+                    }
+                else:
+                    # Pure rename: rekey the in-memory entry, no recompute.
+                    profiles[dst_name] = profiles[src_name]
+                _save(dst_name)
+                # Drop src from memory and disk regardless of which branch.
+                profiles.pop(src_name, None)
+                for ext in (".npz", ".npy"):
+                    p = PROFILES_DIR / f"{src_name}{ext}"
+                    if p.exists():
+                        p.unlink()
+                count = int(profiles[dst_name]["samples"].shape[0])
+                print(
+                    f"renamed: {src_name} → {dst_name} "
+                    f"({count} samples, merged={merged_into_existing})",
+                    file=sys.stderr,
+                )
+                self._json(200, {
+                    "ok": True,
+                    "from": src_name,
+                    "to": dst_name,
+                    "samples": count,
+                    "merged": merged_into_existing,
+                })
+                return
             if url.path == "/enroll":
                 qs = parse_qs(url.query)
                 name = (qs.get("name", [""])[0]).strip()
@@ -462,5 +621,11 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print(f"diarize-server ready on 127.0.0.1:{PORT} (threshold={THRESHOLD}, margin={MARGIN})", file=sys.stderr)
+    print(
+        f"diarize-server ready on 127.0.0.1:{PORT} "
+        f"(preset={settings_preset}, threshold={settings['threshold']}, "
+        f"margin={settings['margin']}, "
+        f"cluster_threshold={settings['cluster_threshold']})",
+        file=sys.stderr,
+    )
     HTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
