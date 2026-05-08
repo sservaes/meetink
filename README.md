@@ -1,6 +1,34 @@
-<p align="center">
-  <img src="docs/images/banner.svg" alt="meetink — local-first meeting transcription for macOS" width="100%">
-</p>
+```
+╭─ meetink v0.1.0 ─────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                                                                              │
+│   ███╗   ███╗███████╗███████╗████████╗██╗███╗   ██╗██╗  ██╗                                                  │
+│   ████╗ ████║██╔════╝██╔════╝╚══██╔══╝██║████╗  ██║██║ ██╔╝                                                  │
+│   ██╔████╔██║█████╗  █████╗     ██║   ██║██╔██╗ ██║█████╔╝                                                   │
+│   ██║╚██╔╝██║██╔══╝  ██╔══╝     ██║   ██║██║╚██╗██║██╔═██╗                                                   │
+│   ██║ ╚═╝ ██║███████╗███████╗   ██║   ██║██║ ╚████║██║  ██╗                                                  │
+│   ╚═╝     ╚═╝╚══════╝╚══════╝   ╚═╝   ╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝                                                  │
+│                                                                                                              │
+│   Hi Stijn — every meeting, inked locally.                                                                   │
+│                                                                                                              │
+│   Tips for getting started                         Status                                                    │
+│   • All set. Dependencies installed.               ● capture binary    ● whisper model    ● whisper-cpp      │
+│   • Type `/start`  to begin transcribing                                                                     │
+│   • Type `/help`   for all commands                ● speaker ID        ● Sonnet titling                      │
+│                                                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+  Made for macOS · Apple Silicon optimized · ~/.meetink
+
+
+Type /help for commands. Tab to autocomplete.
+Tip: Group meetings with /project use acme — recordings, summaries, /ask all scope to it.
+
+meetink ○ >
+
+
+🎙 small.en │ 📁 ~/Documents/meetink/uk-aisi │ 📦 uk-aisi │ 👤 5 profiles │ ✨ Sonnet │ 📚 ready │ 🧠 16GB · 4.8GB free
+○ idle │ context ▱▱▱▱▱▱▱▱ 2% 200K │ /start to record · /help for commands
+```
 
 # meetink
 
@@ -29,6 +57,7 @@ Local-first meeting transcription for the macOS terminal. Captures system audio 
   - [Projects](#projects)
   - [Identity (`/me`)](#identity-me)
   - [Speaker identification (diarize + profiles)](#speaker-identification-diarize--profiles)
+  - [`/watch` — auto-record from your calendar](#watch--auto-record-from-your-calendar)
   - [Local LLM (titling, summaries, /ask)](#local-llm-titling-summaries-ask)
   - [Context documents](#context-documents)
   - [Custom vocabulary](#custom-vocabulary)
@@ -59,7 +88,9 @@ If you take a lot of meetings on your Mac and want a private transcript, you usu
 - **Live, labelled transcripts.** Two streams (mic / system audio), aggressively de-hallucinated, merged into readable lines, written to a per-session file.
 - **AI titles and summaries.** Finished meetings are renamed `2026-05-07_14-32_design-review-followup.txt`, and a `<name>.summary.md` (Topics, Decisions, Action items, Open questions) is generated automatically. Backend is `local` (on-device Qwen3.5-4bit via MLX) or `claude` (your Claude Pro/Max subscription via the `claude` CLI).
 - **`/ask` over the meeting.** Stream answers about the current or most-recent transcript, with project context and prior `/ask` turns automatically threaded in.
-- **Speaker identification.** Optional sidecar (sherpa-onnx + WeSpeaker) labels recurring voices by name once you've enrolled a `/profile`. Unknown voices get clustered live as `THEM-A`, `THEM-B`, …
+- **Auto-record from your calendar.** `/watch on` polls Calendar.app, fires a 1-minute notification before each event with a Skip button, then auto-starts recording at the scheduled time — and auto-stops when the conferencing app (Zoom / Meet / Teams / Webex) goes quiet for 2 min. Catches impromptu calls too: a meeting that starts without a calendar event triggers a confirmation notification ~30 s in. State persists across REPL restarts.
+- **Speaker identification, tunable per meeting.** Optional sidecar (sherpa-onnx + WeSpeaker) labels recurring voices by name once you've enrolled a `/profile`. Unknown voices get clustered live as `THEM-A`, `THEM-B`, … Three sensitivity presets (`focused` / `default` / `strict`) auto-applied from the calendar event's attendee count, plus a per-session **whitelist** that restricts matching to people who are actually in the room — so Mike's voice can never be misidentified as Alice in a 1:1 with Mike.
+- **Self-improving profiles.** High-confidence `/identify` matches fold back into the matched profile, sharpening its centroid from real conversational audio over time. Strict guardrails (confidence floor, margin multiplier, min-samples) prevent the classic pollution failure mode; one bad sample is recoverable with `/profile undo`.
 - **Projects.** Group recordings, summaries, and reference docs by client / topic. `/ask` automatically pulls in past meetings and curated context for the active project.
 - **Context documents.** `/context add report.pdf` converts any PDF / DOCX / XLSX / PPTX / MD into the project's reference set so the LLM can read it.
 - **Native terminal UX.** `prompt_toolkit` REPL with tab completion, native scrollback, native text selection, native ⌘F. Live status footer with elapsed recording time and line count.
@@ -196,11 +227,33 @@ All commands work both inside the REPL (`> /start`) and as CLI subcommands (`mee
 
 | Command | Description |
 |---|---|
-| `/start` | Begin recording mic + system audio. Spawns `whisper-server` and `meetink-capture`, opens a tail window. |
+| `/start` | Begin recording mic + system audio. Spawns `whisper-server` and `meetink-capture`, opens a tail window. Clears any stale per-session whitelist for a clean slate. |
+| `/start <name1> <name2> …` | Same, but restrict speaker matching to those enrolled profiles for this session. Prefixes `with` / `whitelist` are accepted as readability niceties (`/start with alex stacey`). |
 | `/stop` | Stop the capture binary and `whisper-server`. Auto-titles the file, generates `<name>.summary.md`, rebuilds `<project>/meetings.md`. |
 | `/status` | Whether recording is active, plus the current line count of `live.txt`. |
 | `/tail` | Open or raise a separate Terminal.app window tailing `live.txt`. |
 | `/transcripts`, `/ls` | List transcripts in the active project's directory. |
+
+### `/watch` — auto-record from your calendar
+
+Long-running watcher that polls Calendar.app, schedules notifications, and drives `/start` / `/stop` automatically. Setting persists across REPL restarts via `~/.meetink/config`.
+
+| Command | Description |
+|---|---|
+| `/watch on` | Start the watcher (calendar polling every 60 s + meeting-active polling every 30 s for instant detection). 1-minute-before notifications with a Skip button; recording auto-starts at the event's scheduled time. Auto-resumes on next REPL launch. |
+| `/watch off` | Stop the watcher (in-flight recording keeps running — `/stop` ends it). |
+| `/watch status` | Show running state, current recording (with detected source for instant meetings), upcoming events, project routing decisions. |
+| `/watch skip` | Mark the soonest pending/notified event as skipped. |
+| `/watch events [hours]` | Diagnostic: list upcoming events. First run prompts for Calendar access. |
+| `/watch notify` | Diagnostic: send a test notification with action buttons. First run prompts for Notifications permission. |
+| `/watch detect` | Diagnostic: print whether a video call is currently active and which signal fired (process / camera / browser tab). |
+
+When `/watch` auto-records:
+- **Sensitivity** is auto-set from the event's attendee count: 1–2 → `focused`, 3–5 → `default`, 6+ → `strict`.
+- **Whitelist** is auto-derived: profile names matching any name/email token in the attendee list are kept, others are filtered out for this meeting.
+- **Project routing** sends the recording to a matching project subdirectory if the event's title clearly references one (LLM-verified, defaults to no project on doubt).
+- **No tail window** is opened (you're in the meeting, not at the desk).
+- **Instant meetings** — calls that start without a calendar event — fire a confirmation notification (Skip / 60 s default-record) once the conferencing app has been active for one stable poll. Skipping installs a 30-min cooldown for that source.
 
 ### Identity
 
@@ -228,6 +281,27 @@ All commands work both inside the REPL (`> /start`) and as CLI subcommands (`mee
 | `/diarize on` / `off` | Enable / disable speaker ID for future recordings. Install is preserved across `off`. |
 | `/diarize start` / `stop` | Manually start/stop the sidecar (normally handled by `/start` and `/stop`). |
 | `/diarize rm` | Uninstall (deletes venv + model). |
+| `/diarize sensitivity` | Show current matching preset and thresholds. |
+| `/diarize sensitivity focused\|default\|strict` | Switch preset. Hot-applied — takes effect on the very next `/identify`, no restart needed. `/watch` auto-picks based on attendee count. |
+| `/diarize whitelist` | Show the current per-session whitelist (subset of profiles `/identify` will consider). |
+| `/diarize whitelist <name1> <name2> …` | Restrict matching to those profiles. Voices that resemble any other enrolled profile fall through to clustering (THEM-X). |
+| `/diarize whitelist auto` | Re-derive the whitelist from the live recording's `# attendees:` header. Picks up profiles enrolled mid-meeting. |
+| `/diarize whitelist clear` | Drop the restriction (match against all enrolled profiles). |
+| `/diarize auto-train` | Show auto-train state. When on (default), high-confidence `/identify` matches fold back into the matched profile, sharpening its centroid from real conversational audio. |
+| `/diarize auto-train on` / `off` | Toggle. |
+| `/diarize auto-train floor <0.0–1.0>` | Set the confidence floor a match must clear to qualify (default 0.88). |
+| `/diarize auto-train margin <multiplier>` | Set the margin multiplier — top match must beat runner-up by ≥ N × the active MARGIN (default 2.0). |
+| `/diarize auto-train min <count>` | Min profile samples required before auto-train fires for that profile (default 5). |
+
+**Sensitivity presets** trade off how aggressive matching is:
+
+| Preset | THRESHOLD | MARGIN | CLUSTER_THRESHOLD | When to use |
+|---|---|---|---|---|
+| `focused` | 0.62 | 0.12 | 0.55 | 1:1s & small known-speaker meetings. Wide MARGIN guards against bob-vs-alice confusion when two profiles sit close in voice space. Low CLUSTER_THRESHOLD keeps an unmatched speaker as one cluster instead of splintering. |
+| `default` | 0.65 | 0.07 | 0.72 | General purpose. Balanced. |
+| `strict` | 0.70 | 0.10 | 0.78 | Large meetings with strangers. Higher THRESHOLD avoids misnaming a stranger as someone enrolled. Higher CLUSTER_THRESHOLD preserves distinct voices as distinct clusters. |
+
+**Whitelist** is the surgical fix for cross-meeting false-matches. With three profiles enrolled (alex, stacey, florin) and going into a 1:1 with Mike (unenrolled), Mike's voice can score 0.7+ against ALEX just by being a similar-sounding voice. `/diarize whitelist mike` (after enrolling Mike) — or just `/start mike` — restricts `/identify` to {mike} for that session, so any other voice falls cleanly to a cluster letter. `/watch` auto-derives this from calendar attendees on every scheduled recording.
 
 ### Voice profiles
 
@@ -235,11 +309,15 @@ All commands work both inside the REPL (`> /start`) and as CLI subcommands (`mee
 |---|---|
 | `/profile` / `/profile list` | Show enrolled people. |
 | `/profile add <name>` | Record 3 × 5-second voice samples and persist a centroid as `<name>.npz`. The diarize-server must be running. |
-| `/profile train <name>` | Add another sample to sharpen the centroid. |
+| `/profile train <name>` | Record one more 5-second sample and append it. Sharpens the centroid. |
+| `/profile undo <name> [count]` | Pop the last N samples (default 1) off a profile. Recovery for `/profile train` calls that picked up a stray voice, or auto-train additions you don't trust. Refuses to empty a profile (use `/profile rm` for that). |
 | `/profile rm <name>` | Delete a profile. |
+| `/profile rename <old> <new>` | Rename a profile. If `<new>` already exists, **folds** `<old>`'s samples into it (use case: two enrollments turn out to be the same person). Rewrites uppercase labels in the live transcript. |
 | `/profile clusters` | Show the live "unknown" voice clusters (`THEM-A`, `THEM-B`, …) the current session has accumulated. |
-| `/profile assign <letter> <name>` | Convert a live cluster into a real profile **and** rewrite past lines in the current transcript: `THEM-A` → `ALICE`. |
+| `/profile assign <letter> <name>` | Convert a live cluster into a real profile **and** rewrite past lines in the current transcript: `THEM-A` → `ALICE`. Re-assigning into an existing name vstacks samples (so cluster intelligence is preserved). |
 | `/profile merge <from> <into>` | Fold one cluster into another. Useful when one voice gets split across two clusters by background noise. |
+
+When `/profile add`, `/profile train`, `/profile assign`, or `/profile rename` succeeds during a live `/watch`-driven recording, the per-session whitelist is automatically re-derived from the event's `# attendees:` header — so a person enrolled mid-call immediately tightens the matching set without a manual `/diarize whitelist`.
 
 ### Whisper models
 
@@ -356,6 +434,25 @@ By default, system-audio lines are labelled `THEM:`. With `/diarize on` and a pr
 
 Per-chunk diarization: each ~3 s WAV chunk is identified individually (synchronous, ~300 ms via the local sidecar) before the line is written, so the labels you see live are the same labels in the final file.
 
+Three controls let you tune accuracy per situation:
+
+- **Sensitivity preset** (`/diarize sensitivity focused|default|strict`) shifts THRESHOLD / MARGIN / CLUSTER_THRESHOLD as a coherent set. `/watch` picks one automatically based on attendee count.
+- **Per-session whitelist** (`/diarize whitelist alex stacey` or `/start alex stacey`) restricts `/identify` to a subset — the surgical fix for cross-meeting false-matches when a similar-sounding stranger is in the room.
+- **Auto-train** (`/diarize auto-train`, on by default) folds high-confidence matches back into the matched profile so it sharpens over time. Conservative guardrails (floor 0.88, 2× margin, min-samples 5) prevent the classic pollution failure mode; `/profile undo <name>` peels off any add you don't trust.
+
+### `/watch` — auto-record from your calendar
+
+`/watch on` spawns a background thread that:
+
+- Polls Calendar.app every 60 s via a Swift sidecar (`MeetinkAgent.app`, EventKit + UserNotifications). 1-min-before notifications fire with a Skip button.
+- Auto-routes each event to a matching project (LLM-verified — only when the event's title clearly references one of your existing project names).
+- Auto-applies a sensitivity preset and a profile whitelist derived from the attendee list, before `/start` fires.
+- Polls for an active conferencing app (camera in use, Zoom/Teams/Webex/GoogleMeet processes, browser tabs on `meet.google.com` / `webex.com` / `teams.microsoft.com` / `zoom.us` / `whereby.com` / `meet.jit.si` / `around.co`) every 30 s. When a call starts without a calendar event and stays active for one stable poll, fires a "Detected `<source>` call. Recording in 60 s — Skip to ignore" notification.
+- Auto-stops the recording when the conferencing app has been absent for 4 consecutive 30 s polls (≈ 2 min).
+- State persists across REPL restarts via `watch_enabled` in `~/.meetink/config`.
+
+The auto-recording path is intentionally **not** identical to manual `/start` — it suppresses the auto-tail window (you're in the meeting, not at the desk), it sets `MEETINK_EVENT_*` env vars that `meetink-capture` writes into the transcript header (event, attendees, location, RSVP, calendar source, project, instant flag, detected-source), and it routes through `MEETINK_WHITELIST` for the per-session profile restriction.
+
 ### Local LLM (titling, summaries, /ask)
 
 The local backend is Apple's MLX framework with `mlx-community/Qwen3.5-*-4bit` snapshots. Three reasons it matters:
@@ -457,6 +554,39 @@ Anything you need from me?
 The follow-up sees the prior turn — `MLXRuntime.add_ask_pair` records each completed `(question, answer)` pair (cap 5) and `_build_ask_prompt` injects them under "Earlier in this conversation" before the next question.
 
 `/clear` drops the thread.
+
+### Letting `/watch` handle a day of meetings
+
+Turn the watcher on once. It survives REPL restarts (config flag), polls Calendar.app every 60 s, fires a 1-min-before notification with a Skip button for each event, auto-starts recording at the scheduled time, and auto-stops 2 min after the conferencing app goes quiet.
+
+```
+> /watch on
+✓  /watch is on — calendar polling every 60s
+   Auto-record fires 1 min before each event (Skip via notification or /watch skip).
+   /watch off when you're done for the day.
+   (persists across REPL restarts — auto-resumes on launch.)
+
+> /watch status
+
+  ●  /watch: running
+
+  NEXT UP
+  10:30–11:00  accepted   notified   Eng standup → engineering
+  13:00–13:30  accepted   pending    1:1 with Alice → leadership
+
+# Stijn lets the day run. Per meeting, the watcher prints to stderr:
+#   [watch] sensitivity → focused (2 attendees, '1:1 with Alice')
+#   [watch] whitelist → ['alice'] (matched from '1:1 with Alice')
+# and /start fires automatically. No tail window pops up — Stijn is in the call.
+
+# When an unscheduled call starts (someone Slack-calls):
+# Notification: "meetink — instant meeting · Detected zoom call. Recording in 60 s — Skip to ignore."
+# Stijn either clicks Skip or lets the timer run; recording auto-starts and runs
+# until the call ends (Zoom process gone for 2+ min).
+
+> /watch off       # end of day
+✓  /watch off
+```
 
 ### Switching to claude for higher-quality answers on a long call
 
@@ -632,6 +762,21 @@ Transcripts default to `~/Documents/meetink/` because they're your data — they
 | `MEETINK_CLAUDE_MODEL` | `claude-sonnet-4-6` | Which Claude model to use when backend is `claude`. |
 | `MEETINK_MEETINGS_LOG_KEEP` | `50` | Cap on entries in `<project>/meetings.md`. |
 | `MEETINK_CONTEXT_SUMMARY_THRESHOLD` | `800` | Skip summarising context docs shorter than this many tokens. |
+| `MEETINK_WHITELIST` | unset | CSV of profile names. When set, `/start` restricts `/identify` to these for the session. Used internally by `/watch` to pass calendar attendees through to the recording. |
+| `MEETINK_NO_TAIL` | unset | When set (any value), `/start` skips opening the auto-tail Terminal window. Set automatically by `/watch`-driven recordings. |
+
+### Diarization tuning
+
+| Variable | Default | What it controls |
+|---|---|---|
+| `MEETINK_DIARIZE_THRESHOLD` | `0.65` | Cosine similarity required to claim a profile match. |
+| `MEETINK_DIARIZE_MARGIN` | `0.07` | Top profile match must beat runner-up by this. |
+| `MEETINK_DIARIZE_CLUSTER_THRESHOLD` | `0.72` | Cosine similarity required to join an existing cluster. |
+| `MEETINK_DIARIZE_PRESET` | `default` | Preset name read at server start (`focused` / `default` / `strict`). Hot-tunable via `/diarize sensitivity`. |
+| `MEETINK_AUTO_TRAIN` | `true` | Enable folding high-confidence `/identify` matches back into matched profile. |
+| `MEETINK_AUTO_TRAIN_FLOOR` | `0.88` | Match cosine must clear this for auto-train to fire. |
+| `MEETINK_AUTO_TRAIN_MARGIN_MULT` | `2.0` | Top match must beat runner-up by ≥ N × the active MARGIN. |
+| `MEETINK_AUTO_TRAIN_MIN_SAMPLES` | `5` | Profile must already have this many samples before auto-train will add to it. |
 
 ### `~/.meetink/config` keys
 
@@ -645,7 +790,10 @@ local_llm_model=qwen3.5-2b
 title_backend=local
 claude_model=claude-sonnet-4-6
 diarize_enabled=true
+watch_enabled=true
 ```
+
+`watch_enabled` persists `/watch on` / `/watch off` across REPL restarts. When `true`, the REPL auto-resumes the watcher on launch.
 
 ---
 
