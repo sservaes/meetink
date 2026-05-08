@@ -1746,7 +1746,15 @@ def main() -> int:
         emit(f"  \033[2mTranscript:\033[0m \033[36m{MK_TRANSCRIPT}\033[0m")
 
     emit("")
-    emit("\033[2mType /help for commands. Tab to autocomplete.\033[0m")
+    # Random tip from src/repl/tips.py — fresh nudge each launch toward
+    # commands users haven't discovered yet. Falls back to the static
+    # line if the module fails to import for any reason (defensive; it
+    # shouldn't, since tips.py has no external deps).
+    try:
+        from tips import random_tip  # type: ignore[import-not-found]
+        emit(f"\033[2mTip:\033[0m \033[2m{random_tip()}\033[0m")
+    except Exception:
+        emit("\033[2mType /help for commands. Tab to autocomplete.\033[0m")
     emit("")
 
     # patch_stdout lets prints from background threads (none in this design,
