@@ -874,9 +874,50 @@ struct LocalSpeechCapture {
         // map ME-equivalent labels back to a real person without guessing.
         // titling.sh's _transcript_body() already strips lines starting
         // with "# " before feeding the model, so this stays out of titles.
+        //
+        // /watch additionally injects MEETINK_EVENT_* env vars when
+        // auto-recording from a calendar event. Each present field
+        // becomes a header line so /ask can answer questions like
+        // "who was on this call" or "what was the agenda" off the
+        // transcript alone, with no separate sidecar file.
         var header = "# Meeting Transcript\n"
         if meName != "ME" {
             header += "# user: \(meName)\n"
+        }
+        let env = ProcessInfo.processInfo.environment
+        let metadataKeys: [(envKey: String, headerKey: String)] = [
+            ("MEETINK_EVENT_TITLE",     "event"),
+            ("MEETINK_EVENT_START",     "scheduled_start"),
+            ("MEETINK_EVENT_END",       "scheduled_end"),
+            ("MEETINK_EVENT_ATTENDEES", "attendees"),
+            ("MEETINK_EVENT_LOCATION",  "location"),
+            ("MEETINK_EVENT_RSVP",      "rsvp"),
+            ("MEETINK_EVENT_CALENDAR",  "calendar"),
+            ("MEETINK_EVENT_PROJECT",   "project"),
+        ]
+        for (envKey, headerKey) in metadataKeys {
+            if let v = env[envKey]?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !v.isEmpty {
+                // Single-line header values only. Newlines / CRs would
+                // break the parser convention (one fact per `# k: v` line);
+                // collapse them into spaces.
+                let oneLine = v.replacingOccurrences(of: "\n", with: " ")
+                                .replacingOccurrences(of: "\r", with: " ")
+                header += "# \(headerKey): \(oneLine)\n"
+            }
+        }
+        // Notes can be long (Google Meet / Calendly auto-blurbs are huge).
+        // Truncate at ~500 chars so we don't bloat the transcript header
+        // beyond what's useful for /ask. The full event blob lives in
+        // Calendar.app for anyone who really needs it.
+        if let raw = env["MEETINK_EVENT_NOTES"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty {
+            let oneLine = raw.replacingOccurrences(of: "\n", with: " ")
+                              .replacingOccurrences(of: "\r", with: " ")
+            let truncated = oneLine.count > 500
+                ? String(oneLine.prefix(500)) + "…"
+                : oneLine
+            header += "# description: \(truncated)\n"
         }
         header += "Started: \(ISO8601DateFormatter().string(from: Date()))\n\n"
         try header.write(toFile: transcriptPath, atomically: true, encoding: .utf8)

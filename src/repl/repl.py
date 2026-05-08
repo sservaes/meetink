@@ -1548,6 +1548,97 @@ def _try_handle_ask_local(question: str) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# /watch on / off / status / skip — in-process so the watcher thread
+# outlives a single subcommand.
+# ---------------------------------------------------------------------------
+
+def _handle_watch_inproc(args: list[str]) -> bool:
+    """Returns True if handled (caller should NOT fall through to the
+    launcher). Currently always returns True for on/off/status/skip;
+    the dispatch table in handle_command guarantees we only see those."""
+    sub = args[0]
+    try:
+        from watch import WatchManager  # type: ignore[import-not-found]
+    except ImportError as e:
+        emit(f"\033[31merror:\033[0m watch module unavailable: {e}")
+        return True
+    mgr = WatchManager.get()
+
+    if sub in ("on", "start"):
+        if mgr.is_running():
+            emit("\033[33m⚠\033[0m  /watch is already running")
+            return True
+        if not mgr.start():
+            emit("\033[31merror:\033[0m couldn't start /watch")
+            return True
+        emit("\033[32m✓\033[0m  /watch is on — calendar polling every 60s")
+        emit("  \033[2mAuto-record fires 1 min before each event "
+             "(Skip via notification or /watch skip).\033[0m")
+        emit("  \033[2m/watch off when you're done for the day.\033[0m")
+        return True
+
+    if sub in ("off", "stop"):
+        if not mgr.is_running():
+            emit("\033[2m/watch is not running.\033[0m")
+            return True
+        mgr.stop()
+        emit("\033[32m✓\033[0m  /watch off")
+        emit("  \033[2m(any in-flight recording keeps going — "
+             "/stop ends it.)\033[0m")
+        return True
+
+    if sub == "status":
+        snap = mgr.status_summary()
+        emit("")
+        if snap["running"]:
+            emit("  \033[32m●\033[0m  /watch: \033[32mrunning\033[0m")
+        else:
+            emit("  \033[90m○\033[0m  /watch: \033[90midle\033[0m")
+        if snap.get("recording_id"):
+            title = snap.get("recording_title") or "(unknown)"
+            emit(f"  \033[2m  recording:\033[0m  \033[1m{title}\033[0m")
+        upcoming = snap.get("upcoming", [])
+        if upcoming:
+            emit("")
+            emit("  \033[93mNEXT UP\033[0m")
+            for e in upcoming:
+                rsvp = e["rsvp"]
+                rsvp_col = (
+                    "\033[32m" if rsvp == "accepted"
+                    else "\033[33m" if rsvp in ("tentative", "pending")
+                    else "\033[31m" if rsvp == "declined"
+                    else "\033[90m"
+                )
+                proj = (f" \033[35m→ {e['project']}\033[0m"
+                        if e.get("project") else "")
+                status_col = (
+                    "\033[32m" if e["status"] == "notified"
+                    else "\033[33m" if e["status"] == "deferred"
+                    else "\033[31m" if e["status"] == "skipped"
+                    else "\033[90m"
+                )
+                emit(f"  \033[2m{e['start']}–{e['end']}\033[0m  "
+                     f"{rsvp_col}{rsvp:9}\033[0m  "
+                     f"{status_col}{e['status']:9}\033[0m  "
+                     f"\033[1m{e['title']}\033[0m{proj}")
+        emit("")
+        return True
+
+    if sub == "skip":
+        if not mgr.is_running():
+            emit("\033[2m/watch is not running.\033[0m")
+            return True
+        title = mgr.skip_next()
+        if title is None:
+            emit("\033[2mNo upcoming event to skip.\033[0m")
+        else:
+            emit(f"\033[32m✓\033[0m  Skipped: \033[1m{title}\033[0m")
+        return True
+
+    return False  # unreachable given the dispatch guard
+
+
 def handle_command(line: str) -> bool:
     """Dispatch a slash command. Returns False to quit, True to continue.
 
@@ -1602,6 +1693,15 @@ def handle_command(line: str) -> bool:
     if cmd in ("/help", "/h", "/?"):
         emit(HELP_TEXT)
         return True
+
+    # /watch on / off / status / skip live inside the REPL process because
+    # the WatchManager owns a polling thread that has to outlive a single
+    # subcommand. The diagnostic subcommands (events / notify / detect /
+    # help) keep going through the launcher — they're stateless one-shots.
+    if cmd == "/watch" and args and args[0] in ("on", "start", "off", "stop",
+                                                  "status", "skip"):
+        if _handle_watch_inproc(args):
+            return True
 
     # /ask: try the in-process MLX path first (model stays resident across
     # calls, second + subsequent /ask <1s). Falls through to subprocess

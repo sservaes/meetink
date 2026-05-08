@@ -166,15 +166,13 @@ cmd_watch() {
         events|list)        watch_events "$2" ;;
         notify|notification) watch_notify ;;
         detect|status|active) watch_detect ;;
-        # Phase-2 placeholders. Keep them returning a clear "not yet"
-        # message so users get a hint that the feature exists but the
-        # auto-record loop isn't wired yet.
-        on|start)
-            print -P "${C[dim]}/watch on coming in phase 2 — auto-record on calendar events.${C[reset]}"
-            print -P "  ${C[dim]}For now, use${C[reset]} ${C[bright_cyan]}/watch events${C[reset]}${C[dim]}, ${C[reset]}${C[bright_cyan]}/watch notify${C[reset]}${C[dim]}, ${C[reset]}${C[bright_cyan]}/watch detect${C[reset]} ${C[dim]}to validate the agent.${C[reset]}"
-            ;;
-        off|stop)
-            print -P "${C[dim]}/watch is not running yet (phase 2).${C[reset]}"
+        # on/off/status/skip live inside the REPL because the watcher is
+        # a thread of the python REPL process, not the launcher (the
+        # launcher is one-shot). Anyone hitting these from a bare
+        # `meetink watch on` shell call gets a hint to use the REPL.
+        on|start|off|stop|status|skip)
+            print -P "${C[dim]}/watch ${sub} only works inside the meetink REPL.${C[reset]}"
+            print -P "  Run ${C[bright_cyan]}meetink${C[reset]} ${C[dim]}with no args, then${C[reset]} ${C[bright_cyan]}/watch ${sub}${C[reset]}${C[dim]}.${C[reset]}"
             ;;
         ""|help)
             print -P ""
