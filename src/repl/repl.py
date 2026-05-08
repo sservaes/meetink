@@ -362,6 +362,60 @@ def _ram_free_gb() -> float:
 FOOTER_SEP = "\033[90m │ \033[0m"
 
 
+# Cached chip for the RAG indexer. File-IO-light, but the footer ticks
+# every 1s; cache the rendered string for 2s so we don't stat the .idx
+# dir every refresh.
+_index_chip_cache: dict = {"text": None, "ts": 0.0}
+
+
+def _index_chip() -> str:
+    """Status chip for the RAG sidecar indexer. Renders only when there
+    is something useful to say — empty when the deps are installed and
+    nothing is recording, so the footer stays clean.
+
+    States:
+      📚 off            — sentence-transformers not installed
+      📚 starting       — recording active, embedder still loading
+      📚 NN L · M segs  — recording active, indexer keeping up
+    """
+    now = time.time()
+    if (_index_chip_cache["text"] is not None and
+            now - _index_chip_cache["ts"] < 2.0):
+        return _index_chip_cache["text"]
+
+    text = ""
+    try:
+        from index import IndexManager  # type: ignore[import-not-found]
+        from index.retriever import chunk_count  # type: ignore[import-not-found]
+    except ImportError:
+        _index_chip_cache["text"] = ""
+        _index_chip_cache["ts"] = now
+        return ""
+
+    mgr = IndexManager.get()
+    if not mgr.is_available():
+        text = "\033[90m📚 off\033[0m"
+    elif is_running():
+        tx = _ask_transcript_path()
+        if tx is not None:
+            n = chunk_count(tx)
+            seg_dir = tx.with_suffix(".idx") / "segments"
+            seg_count = 0
+            if seg_dir.is_dir():
+                try:
+                    seg_count = sum(1 for _ in seg_dir.glob("*.md"))
+                except OSError:
+                    pass
+            if n > 0:
+                text = f"\033[36m📚 {n}L · {seg_count} segs\033[0m"
+            else:
+                text = "\033[33m📚 starting\033[0m"
+
+    _index_chip_cache["text"] = text
+    _index_chip_cache["ts"] = now
+    return text
+
+
 def _footer_top_raw() -> str:
     """Static-ish config: model, transcripts folder, speaker-ID setup state."""
     parts: list[str] = []
@@ -394,6 +448,10 @@ def _footer_top_raw() -> str:
         parts.append(f"\033[36m✨ {_titling_label()}\033[0m")
     else:
         parts.append("\033[90m✨ off\033[0m")
+
+    chip = _index_chip()
+    if chip:
+        parts.append(chip)
 
     total = _ram_total_gb()
     free = _ram_free_gb()
@@ -1385,15 +1443,19 @@ def _try_handle_ask_local(question: str) -> bool:
         else:
             docs_label = f" · {stats['doc_count']} docs"
     meetings_label = " · past meetings" if stats["had_past_meetings"] else ""
+    index_label = ""
+    if stats.get("used_index"):
+        n = stats.get("indexed_chunks", 0)
+        index_label = f" · indexed {n}L"
     if loading:
         emit(
             f"\033[2mLoading {model_path.name} (~2-3s cold start)... "
-            f"({used_kb:.1f}K of {budget_kb}K{meetings_label}{docs_label})\033[0m"
+            f"({used_kb:.1f}K of {budget_kb}K{meetings_label}{docs_label}{index_label})\033[0m"
         )
     else:
         emit(
             f"\033[2mAsking {model_path.name}... "
-            f"({used_kb:.1f}K of {budget_kb}K{meetings_label}{docs_label})\033[0m"
+            f"({used_kb:.1f}K of {budget_kb}K{meetings_label}{docs_label}{index_label})\033[0m"
         )
 
     # Warn loudly if even the most-compact strategy still overshoots — the
