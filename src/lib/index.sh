@@ -46,27 +46,16 @@ except Exception:
 }
 
 
-# Detect a legacy sentence-transformers install so we can clean it up
-# during /index install. Two reasons to remove it: free ~700 MB of disk
-# (torch + transformers), and avoid future confusion if the import
-# regression resurfaces.
-_index_has_legacy_st() {
-    [[ -x "$MK_PY_VENV/bin/python" ]] && \
-        "$MK_PY_VENV/bin/python" -c "import sentence_transformers" 2>/dev/null
-    # Also catches a half-broken install where the package directory
-    # exists but the import errors out — uv's metadata is the source
-    # of truth, so check that.
-    if [[ $? -ne 0 ]]; then
-        # Import failed; check the metadata directly.
-        "$MK_PY_VENV/bin/python" -c \
-            "import importlib.metadata as m; m.version('sentence-transformers')" \
-            2>/dev/null
-    fi
-}
-
-
 # Install fastembed into the REPL venv. ~50 MB; bge-small.onnx (~80 MB)
 # downloads on first encode() call into ~/.cache/fastembed.
+#
+# Important: we deliberately do NOT uninstall pre-existing packages here.
+# A previous version tried to clean up the legacy sentence-transformers
+# stack (sentence-transformers + torch + transformers + tokenizers +
+# safetensors) but transformers + safetensors + tokenizers are also
+# dependencies of mlx-lm, which we *do* want. Removing them broke the
+# titling chip (✨ off) until the user re-ran meetink setup. Now we
+# leave shared deps alone and only fastembed gets touched.
 index_install() {
     if [[ ! -x "$MK_PY_VENV/bin/python" ]]; then
         print -P "${C[red]}error:${C[reset]} REPL Python venv missing — run ${C[bright_cyan]}meetink setup${C[reset]} first"
@@ -79,16 +68,6 @@ index_install() {
     if ! command -v uv >/dev/null 2>&1; then
         print -P "${C[red]}error:${C[reset]} uv not found — run ${C[bright_cyan]}meetink setup${C[reset]} first"
         return 1
-    fi
-
-    # Migrate away from the legacy sentence-transformers stack if
-    # present. This frees ~700 MB and removes the broken transformers
-    # import path that crashed the REPL on previous installs.
-    if _index_has_legacy_st >/dev/null 2>&1; then
-        print -P "${C[bright_yellow]}▸${C[reset]} Removing legacy sentence-transformers install ${C[dim]}(~700 MB freed)...${C[reset]}"
-        uv pip uninstall --python "$MK_PY_VENV/bin/python" \
-            sentence-transformers torch transformers tokenizers safetensors \
-            2>/dev/null || true
     fi
 
     print -P "${C[bright_yellow]}▸${C[reset]} Installing index dependencies ${C[dim]}(~50 MB, ONNX-based)...${C[reset]}"
