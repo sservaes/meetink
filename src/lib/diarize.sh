@@ -331,6 +331,66 @@ diarize_whitelist() {
         return 0
     fi
 
+    # /diarize whitelist auto — re-derive from the live transcript's
+    # `# attendees:` header. Picks up profiles enrolled mid-recording
+    # (the failure mode: /watch set [] at meeting-start because no
+    # attendees were enrolled yet; user then /profile assign'd one
+    # of them, but the whitelist stayed empty).
+    if [[ "$first" == "auto" || "$first" == "rederive" || "$first" == "refresh" ]]; then
+        local live="$MK_TRANSCRIPTS_DIR/live.txt"
+        local txt="$live"
+        [[ -L "$live" ]] && txt=$(readlink "$live" 2>/dev/null)
+        if [[ ! -f "$txt" ]]; then
+            print -P "${C[red]}error:${C[reset]} no live recording — /diarize whitelist auto only works mid-meeting"
+            return 1
+        fi
+        # Use python for the tokenisation + matching so we share the
+        # same word-boundary semantics as the watcher's
+        # _match_attendees_to_profiles. zsh string-munging would diverge.
+        local matched=$("$MK_PY_VENV/bin/python" - "$txt" "$MK_DIARIZE_PORT" 2>/dev/null <<'PY'
+import json, re, sys, urllib.request
+txt_path, port = sys.argv[1], sys.argv[2]
+attendees = ""
+try:
+    with open(txt_path, encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("# attendees:"):
+                attendees = line.split(":", 1)[1].strip()
+                break
+            if not line.startswith("#") and line.strip():
+                break  # past header
+except OSError:
+    sys.exit(0)
+if not attendees:
+    sys.exit(0)
+try:
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/profiles", timeout=2) as r:
+        profile_names = [p["name"] for p in json.loads(r.read()).get("profiles", [])]
+except Exception:
+    sys.exit(0)
+haystack = set()
+for tok in re.split(r"[\s.,@+\-_/]+", attendees.lower()):
+    if tok:
+        haystack.add(tok)
+matched = [p for p in profile_names if p.lower() in haystack]
+print(",".join(matched))
+PY
+)
+        if [[ -z "$matched" ]]; then
+            print -P "${C[yellow]}⚠${C[reset]}  No enrolled profiles match the current event's attendees"
+            print -P "  ${C[dim]}attendees header missing or none of your profiles map to those names${C[reset]}"
+            return 1
+        fi
+        local resp=$(curl -s -X POST "http://127.0.0.1:$MK_DIARIZE_PORT/session/whitelist?profiles=$matched")
+        if ! _resp_ok "$resp"; then
+            print -P "${C[red]}error:${C[reset]} $resp"
+            return 1
+        fi
+        local pretty=$(print -- "$matched" | sed 's/,/, /g')
+        print -P "${C[green]}✓${C[reset]} Whitelist → ${C[bold]}${pretty}${C[reset]} ${C[dim]}(re-derived from event attendees)${C[reset]}"
+        return 0
+    fi
+
     # Treat all positional args as profile names. Comma-encode for the
     # query string, URL-safety-wise these are simple identifiers (no
     # slashes/dots permitted by /profile add).
@@ -557,6 +617,8 @@ profile_add() {
     print -P "${C[green]}${C[bold]}✓ Profile saved: $name${C[reset]}"
     print -P "  ${C[dim]}Voice will be recognised in future recordings (when sufficiently similar).${C[reset]}"
     print ""
+
+    _maybe_refresh_whitelist_from_attendees
 }
 
 profile_train() {
@@ -593,6 +655,7 @@ profile_train() {
     if _resp_ok "$resp"; then
         local total=$(print -- "$resp" | sed -nE 's/.*"samples":[[:space:]]*([0-9]+).*/\1/p')
         print -P "  ${C[green]}✓${C[reset]} added (total: $total samples)"
+        _maybe_refresh_whitelist_from_attendees
     else
         print -P "  ${C[red]}server error:${C[reset]} $resp"
     fi
@@ -726,6 +789,61 @@ profile_assign() {
         local actual=$(readlink "$MK_TRANSCRIPT" 2>/dev/null)
         print -P "${C[green]}✓${C[reset]} Renamed ${C[dim]}THEM-${up_letter}${C[reset]} → ${C[bold]}${up_name}${C[reset]} in ${C[bright_cyan]}${actual:t}${C[reset]}"
     fi
+
+    # If the meeting was auto-recorded by /watch, the whitelist may have
+    # been cleared at meeting-start because the just-promoted person
+    # wasn't enrolled yet. Now they are — re-derive so the rest of the
+    # call is properly restricted. Best-effort, silent on no-match.
+    _maybe_refresh_whitelist_from_attendees
+}
+
+# Recompute /session/whitelist from the live transcript's # attendees:
+# header. Triggered after /profile assign / add / train so a person
+# enrolled mid-recording immediately tightens the matching set. No-op
+# if no live recording or no attendees header (manual /start without
+# /watch).
+_maybe_refresh_whitelist_from_attendees() {
+    [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null || return 0
+    diarize_running 2>/dev/null || return 0
+    local live="$MK_TRANSCRIPTS_DIR/live.txt"
+    local txt="$live"
+    [[ -L "$live" ]] && txt=$(readlink "$live" 2>/dev/null)
+    [[ -f "$txt" ]] || return 0
+    grep -q "^# attendees:" "$txt" 2>/dev/null || return 0
+
+    local matched=$("$MK_PY_VENV/bin/python" - "$txt" "$MK_DIARIZE_PORT" 2>/dev/null <<'PY'
+import json, re, sys, urllib.request
+txt_path, port = sys.argv[1], sys.argv[2]
+attendees = ""
+try:
+    with open(txt_path, encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("# attendees:"):
+                attendees = line.split(":", 1)[1].strip()
+                break
+            if not line.startswith("#") and line.strip():
+                break
+except OSError:
+    sys.exit(0)
+if not attendees:
+    sys.exit(0)
+try:
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/profiles", timeout=2) as r:
+        profile_names = [p["name"] for p in json.loads(r.read()).get("profiles", [])]
+except Exception:
+    sys.exit(0)
+haystack = set()
+for tok in re.split(r"[\s.,@+\-_/]+", attendees.lower()):
+    if tok:
+        haystack.add(tok)
+matched = [p for p in profile_names if p.lower() in haystack]
+print(",".join(matched))
+PY
+)
+    [[ -z "$matched" ]] && return 0
+    curl -s -X POST "http://127.0.0.1:$MK_DIARIZE_PORT/session/whitelist?profiles=$matched" >/dev/null
+    local pretty=$(print -- "$matched" | sed 's/,/, /g')
+    print -P "  ${C[dim]}Whitelist updated:${C[reset]} ${C[bright_cyan]}${pretty}${C[reset]}"
 }
 
 # Pop the last N samples off a profile and recompute its centroid.
@@ -797,6 +915,8 @@ profile_rename() {
         local actual=$(readlink "$MK_TRANSCRIPT" 2>/dev/null)
         print -P "${C[green]}✓${C[reset]} Renamed ${C[dim]}${up_from}${C[reset]} → ${C[bold]}${up_to}${C[reset]} in ${C[bright_cyan]}${actual:t}${C[reset]}"
     fi
+
+    _maybe_refresh_whitelist_from_attendees
 }
 
 # Fold one cluster into another (e.g. when one speaker got split across two).
