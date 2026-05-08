@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/images/banner.svg" alt="meetink — local-first meeting transcription for macOS" width="100%">
+</p>
+
 # meetink
 
 Local-first meeting transcription for the macOS terminal. Captures system audio (Zoom, Meet, Teams, anything that plays through the speakers) and your microphone simultaneously, runs them through `whisper.cpp` on-device, optionally identifies who is speaking, generates AI titles and summaries, and lets you ask questions about the meeting — all without sending a byte to the cloud.
@@ -172,13 +176,14 @@ Run `meetink` with no arguments at a TTY to drop into the REPL:
 └──────────────────────────────────────────────────────────────────────┘
 
 > _
-🎙 qwen3.5-2b │ 📁 acme-corp │ 👤 STIJN │ ✨ local titling
-● recording 02:14 │ 24 lines
+🎙 qwen3.5-2b │ 📁 acme-corp │ 👤 STIJN │ ✨ local titling │ 🧠 32GB · 14.3GB free
+● recording 02:14 │ 24 lines │ context ▰▰▰▰▰▱▱▱ 62% 16K
 ```
 
 - **Tab completion** — start typing `/` and hit Tab. Fuzzy completion on subcommands and (where it makes sense) on names: profile names, project names, attached context docs.
 - **Native scroll & selection** — wheel scroll, click-and-drag select, ⌘C, ⌘F all work because the REPL runs *inline* (not in alt-screen mode). The footer scrolls with content; scroll back to the prompt to see the live status.
 - **Streaming `/ask`** — answers stream token-by-token while the prompt stays usable. `/clear` clears the screen *and* drops the in-session `/ask` thread.
+- **Live context-bar** — the `context ▰▰▰▰▰▱▱▱ 62% 16K` chip on the bottom row shows how much of the active local model's token budget the next `/ask` will consume (transcript + Q&A history). Green → yellow → red as the meeting grows. Hidden when the `claude` backend is active (its 200K+ window makes the chip uninformative).
 - **Slash command dispatch** — every slash command shells out to `bin/meetink <subcmd>` for stateful work; the REPL only owns the UI and the resident MLX model.
 
 ---

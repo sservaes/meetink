@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 320" width="1200" height="320" font-family="ui-monospace, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" role="img" aria-labelledby="title desc">
+  <title id="title">meetink — local-first meeting transcription for macOS</title>
+  <desc id="desc">A terminal-style banner showing the meetink wordmark, a sample transcript with three speakers (STIJN, ALICE, BOB), and a status footer.</desc>
+
+  <!-- Terminal window -->
+  <rect x="0" y="0" width="1200" height="320" rx="12" ry="12" fill="#0d1117"/>
+
+  <!-- Title bar -->
+  <path d="M0,12 a12,12 0 0 1 12,-12 h1176 a12,12 0 0 1 12,12 v24 h-1200 z" fill="#161b22"/>
+  <line x1="0" y1="36" x2="1200" y2="36" stroke="#21262d" stroke-width="1"/>
+
+  <!-- Traffic lights -->
+  <circle cx="22" cy="18" r="6" fill="#ff5f56"/>
+  <circle cx="44" cy="18" r="6" fill="#ffbd2e"/>
+  <circle cx="66" cy="18" r="6" fill="#27c93f"/>
+
+  <!-- Title bar label -->
+  <text x="600" y="23" fill="#8b949e" font-size="12" text-anchor="middle">meetink — ~/Documents/meetink/acme-corp</text>
+
+  <!-- Wordmark -->
+  <text x="32" y="100" fill="#7ee787" font-size="56" font-weight="700" letter-spacing="-1">meetink</text>
+  <text x="32" y="128" fill="#8b949e" font-size="14">local-first meeting transcription · macOS · Apple Silicon · 100% on-device</text>
+
+  <!-- Transcript sample -->
+  <g font-size="15">
+    <text x="32"  y="178" fill="#58a6ff">[14:32:08]</text>
+    <text x="138" y="178" fill="#f0f6fc">STIJN:</text>
+    <text x="208" y="178" fill="#c9d1d9">yeah I think we should ship it next week</text>
+
+    <text x="32"  y="206" fill="#58a6ff">[14:32:14]</text>
+    <text x="138" y="206" fill="#f0f6fc">ALICE:</text>
+    <text x="208" y="206" fill="#c9d1d9">agreed, let's get the design review on the calendar</text>
+
+    <text x="32"  y="234" fill="#58a6ff">[14:32:21]</text>
+    <text x="138" y="234" fill="#f0f6fc">BOB:</text>
+    <text x="208" y="234" fill="#c9d1d9">I can take action item on the marketing site</text>
+  </g>
+
+  <!-- Footer divider -->
+  <line x1="32" y1="262" x2="1168" y2="262" stroke="#21262d" stroke-width="1"/>
+
+  <!-- Status footer -->
+  <g font-size="13">
+    <text x="32" y="284" fill="#8b949e">qwen3.5-2b  ·  acme-corp  ·  STIJN  ·  local titling</text>
+    <text x="32" y="304" fill="#8b949e"><tspan fill="#3fb950">●</tspan>  recording 02:14  ·  24 lines  ·  context</text>
+    <!-- Context bar: 8 segments, 5 filled (gradient green→yellow), 3 dim -->
+    <g>
+      <rect x="278" y="294" width="12" height="12" fill="#39d353"/>
+      <rect x="293" y="294" width="12" height="12" fill="#52d35b"/>
+      <rect x="308" y="294" width="12" height="12" fill="#7ee787"/>
+      <rect x="323" y="294" width="12" height="12" fill="#a3e635"/>
+      <rect x="338" y="294" width="12" height="12" fill="#facc15"/>
+      <rect x="353" y="294" width="12" height="12" fill="#21262d"/>
+      <rect x="368" y="294" width="12" height="12" fill="#21262d"/>
+      <rect x="383" y="294" width="12" height="12" fill="#21262d"/>
+    </g>
+    <text x="403" y="304" fill="#facc15">62%</text>
+    <text x="438" y="304" fill="#8b949e">16K</text>
+  </g>
+</svg>
