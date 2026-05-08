@@ -369,14 +369,14 @@ _index_chip_cache: dict = {"text": None, "ts": 0.0}
 
 
 def _index_chip() -> str:
-    """Status chip for the RAG sidecar indexer. Renders only when there
-    is something useful to say — empty when the deps are installed and
-    nothing is recording, so the footer stays clean.
+    """Status chip for the RAG sidecar indexer. Always renders so the
+    user gets positive confirmation that the install worked.
 
     States:
-      📚 off            — sentence-transformers not installed
-      📚 starting       — recording active, embedder still loading
-      📚 NN L · M segs  — recording active, indexer keeping up
+      📚 off             — fastembed not installed
+      📚 ready           — installed, no recording active
+      📚 starting        — recording active, embedder still loading
+      📚 NN L · M segs   — recording active, indexer keeping up
     """
     now = time.time()
     if (_index_chip_cache["text"] is not None and
@@ -410,6 +410,10 @@ def _index_chip() -> str:
                 text = f"\033[36m📚 {n}L · {seg_count} segs\033[0m"
             else:
                 text = "\033[33m📚 starting\033[0m"
+        else:
+            text = "\033[36m📚 ready\033[0m"
+    else:
+        text = "\033[36m📚 ready\033[0m"
 
     _index_chip_cache["text"] = text
     _index_chip_cache["ts"] = now

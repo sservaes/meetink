@@ -490,6 +490,16 @@ cmd_start() {
     print -P "  Transcript: ${C[bright_cyan]}${session_file/$HOME/~}${C[reset]}"
     print -P "  Live link:  ${C[dim]}${MK_TRANSCRIPT/$HOME/~}${C[reset]}"
     print -P "  Stop with: ${C[bright_cyan]}/stop${C[reset]}"
+
+    # Surface the RAG indexer install hint when the deps aren't there
+    # yet — /start is the moment users notice they're committing to a
+    # recording, so it's the natural place to nudge them. Skipped when
+    # the indexer is already available (no nag) or when index.sh wasn't
+    # sourced for some reason (defensive).
+    if typeset -f index_available >/dev/null 2>&1 && \
+       ! index_available; then
+        print -P "  ${C[dim]}Tip: run${C[reset]} ${C[bright_cyan]}/index install${C[reset]} ${C[dim]}(~50 MB) to enable RAG-backed${C[reset]} ${C[bright_cyan]}/ask${C[reset]} ${C[dim]}on long meetings.${C[reset]}"
+    fi
     print -P ""
 
     # Auto-open a separate Terminal window tailing the live transcript so
