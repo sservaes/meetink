@@ -2,11 +2,11 @@
 import PackageDescription
 
 let package = Package(
-    name: "local-speech-capture",
+    name: "meetink-capture",
     platforms: [.macOS(.v14)],
     targets: [
         .executableTarget(
-            name: "local-speech-capture",
+            name: "meetink-capture",
             path: "Sources",
             linkerSettings: [
                 .linkedFramework("ScreenCaptureKit"),

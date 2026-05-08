@@ -11,14 +11,27 @@ let samplesPerChunk = Int(sampleRate) * chunkDurationSeconds
 let whisperPort = 8178
 let diarizePort = 8179
 
-let whisperModel = ProcessInfo.processInfo.environment["LOCAL_SPEECH_MODEL"]
-    ?? "\(NSHomeDirectory())/.local-speech/models/ggml-small.en.bin"
-let transcriptPath = ProcessInfo.processInfo.environment["LOCAL_SPEECH_TRANSCRIPT"]
-    ?? "\(NSHomeDirectory())/.local-speech/transcripts/live.txt"
-let chunkDir = ProcessInfo.processInfo.environment["LOCAL_SPEECH_CHUNK_DIR"]
-    ?? "/tmp/local-speech-chunks"
-let whisperPromptPath = ProcessInfo.processInfo.environment["LOCAL_SPEECH_PROMPT"]
-    ?? "\(NSHomeDirectory())/.local-speech/prompts/default.txt"
+let whisperModel = ProcessInfo.processInfo.environment["MEETINK_MODEL"]
+    ?? "\(NSHomeDirectory())/.meetink/models/ggml-small.en.bin"
+let transcriptPath = ProcessInfo.processInfo.environment["MEETINK_TRANSCRIPT"]
+    ?? "\(NSHomeDirectory())/.meetink/transcripts/live.txt"
+let chunkDir = ProcessInfo.processInfo.environment["MEETINK_CHUNK_DIR"]
+    ?? "/tmp/meetink-chunks"
+let whisperPromptPath = ProcessInfo.processInfo.environment["MEETINK_PROMPT"]
+    ?? "\(NSHomeDirectory())/.meetink/prompts/default.txt"
+
+// User identity. The mic stream always belongs to whoever is running
+// meetink, so we don't diarize it — we just label it. By default that
+// label is "ME"; if the launcher set MEETINK_ME_NAME (from /me <name>
+// in the REPL), we use that instead, uppercased. Persisting the name
+// also lets future /ask features know who the user is in the transcript.
+let meName: String = {
+    if let raw = ProcessInfo.processInfo.environment["MEETINK_ME_NAME"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty {
+        return raw.uppercased()
+    }
+    return "ME"
+}()
 
 // MARK: - WAV Writer
 
@@ -147,6 +160,39 @@ final class TranscriptContext: @unchecked Sendable {
 
 let transcriptContext = TranscriptContext()
 
+// MARK: - Speaker Index (tinydiarize)
+
+/// Monotonic speaker counter for tinydiarize. Not recycled — long meetings
+/// can roll into AA, AB, … so labels stay unique within a session.
+final class SpeakerIndex: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _index = 0
+
+    func current() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        return _index
+    }
+
+    @discardableResult
+    func increment() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        _index += 1
+        return _index
+    }
+}
+
+let speakerIndex = SpeakerIndex()
+
+/// 0→A, 1→B, … 25→Z, 26→AA, 27→AB, …
+func speakerLetter(_ i: Int) -> String {
+    if i < 26 {
+        return String(UnicodeScalar(65 + i)!)
+    }
+    let first = (i / 26) - 1
+    let second = i % 26
+    return "\(String(UnicodeScalar(65 + first)!))\(String(UnicodeScalar(65 + second)!))"
+}
+
 // MARK: - Hallucination Filter
 
 let whisperHallucinations: Set<String> = [
@@ -185,6 +231,10 @@ func isHallucination(_ text: String) -> Bool {
     }
     // Pattern: entire text is a parenthetical like (some noise)
     if lower.hasPrefix("(") && lower.hasSuffix(")") && lower.count < 40 { return true }
+    // Same in brackets: [typing] [silence] [clears throat] [SQUEAK] — whisper
+    // emits these too, especially on the system-audio stream during quiet
+    // moments. Same length cap as the parenthetical rule.
+    if lower.hasPrefix("[") && lower.hasSuffix("]") && lower.count < 40 { return true }
     // Single filler word
     if ["you", "yeah", "um", "uh", "hmm", "okay", "ok", "done", "done."].contains(lower) { return true }
 
@@ -195,6 +245,19 @@ func isHallucination(_ text: String) -> Bool {
 
     // YouTube-style hallucinations (substring match)
     for phrase in youtubeHallucinations {
+        if lower.contains(phrase) { return true }
+    }
+
+    // Whisper prompt-leakage. The initial prompt biases decoding, but during
+    // quiet/unclear stretches whisper sometimes regurgitates the prompt
+    // verbatim. We ship an empty prompt by default, but filter against the
+    // historical default + obvious prompt-shaped phrases for safety.
+    let promptLeakPhrases = [
+        "use natural punctuation",
+        "the following is a transcription",
+        "full sentences",
+    ]
+    for phrase in promptLeakPhrases {
         if lower.contains(phrase) { return true }
     }
 
@@ -340,7 +403,14 @@ final class DiarizeAudioBuffer: @unchecked Sendable {
     private let lock = NSLock()
     private var samples: [Float] = []
     private var lastSpeaker: String = "THEM"
-    private let targetSamples = Int(sampleRate) * 10  // 10 seconds of audio
+    // 5s windows with 1.5s overlap. Shorter windows are more likely to be
+    // single-speaker — a 10s window during fast back-and-forth produced a
+    // mixed embedding that consistently merged both voices into one cluster.
+    // Speaker-embedding nets need ~1s minimum to be stable, so 5s gives the
+    // model enough signal while still catching turn changes faster than
+    // the prior 10s. Side effect: more clusters; if one voice splits across
+    // two clusters the user can recover with `/profile merge A B`.
+    private let targetSamples = Int(sampleRate) * 5
 
     /// Add samples and return WAV data if buffer is full enough
     func addAndMaybeFlush(_ newSamples: [Float]) -> Data? {
@@ -352,8 +422,10 @@ final class DiarizeAudioBuffer: @unchecked Sendable {
             return nil
         }
 
-        // Take the buffered audio, keep last 3s for overlap
-        let keepSamples = Int(sampleRate) * 3
+        // Keep ~1.5s for overlap so consecutive embeddings share enough
+        // context for stable matching, but not so much that two windows
+        // see the same turn change.
+        let keepSamples = Int(Double(sampleRate) * 1.5)
         let toProcess = samples
         samples = Array(samples.suffix(keepSamples))
         lock.unlock()
@@ -474,27 +546,22 @@ func transcribe(wavURL: URL, chunkIndex: Int, speaker: String) {
 
     let wavData = (try? Data(contentsOf: wavURL)) ?? Data()
 
-    // For system audio, accumulate into diarize buffer and send when full (~10s)
+    // Per-chunk diarization. We used to buffer ~5s of system audio before
+    // calling /identify, but that meant fast back-and-forth got embedded as
+    // a *mix* of both voices and consistently merged into one cluster. By
+    // identifying each 3s chunk on its own, every transcript line gets its
+    // own speaker decision — close to per-turn resolution for normal
+    // conversation pace. /identify is synchronous (~300ms) and runs before
+    // whisper-server, so the transcript line we write below already has
+    // the right label. diarizeBuffer's `lastSpeaker` is now just a fallback
+    // for the first chunks before any /identify completes.
     if speaker == "THEM" && !wavData.isEmpty {
-        // Decode WAV samples back from the file for buffering
-        let audioSamples: [Float] = wavData.withUnsafeBytes { ptr in
-            guard wavData.count > 44 else { return [] }
-            let int16Ptr = ptr.baseAddress!.advanced(by: 44).assumingMemoryBound(to: Int16.self)
-            let sampleCount = (wavData.count - 44) / 2
-            return (0..<sampleCount).map { Float(int16Ptr[$0]) / 32767.0 }
-        }
-
-        if let diarizeWAV = diarizeBuffer.addAndMaybeFlush(audioSamples) {
-            // Buffer full — send to diarize service in background
-            let idx = chunkIndex
-            DispatchQueue.global().async {
-                if let identified = diarizeSpeaker(wavData: diarizeWAV, chunkIndex: idx) {
-                    let prev = diarizeBuffer.getCurrentSpeaker()
-                    diarizeBuffer.setCurrentSpeaker(identified.uppercased())
-                    if prev != identified.uppercased() {
-                        fputs("  speaker changed: \(prev) -> \(identified.uppercased())\n", stderr)
-                    }
-                }
+        if let identified = diarizeSpeaker(wavData: wavData, chunkIndex: chunkIndex) {
+            let prev = diarizeBuffer.getCurrentSpeaker()
+            let next = identified.uppercased()
+            diarizeBuffer.setCurrentSpeaker(next)
+            if prev != next {
+                fputs("  speaker changed: \(prev) -> \(next)\n", stderr)
             }
         }
     }
@@ -566,7 +633,51 @@ func transcribe(wavURL: URL, chunkIndex: Int, speaker: String) {
     // Clean up chunk file
     try? FileManager.default.removeItem(at: wavURL)
 
-    // Use the latest diarized speaker from the buffer, or fall back to THEM
+    let elapsed = String(format: "%.1fs", Date().timeIntervalSince(startTime))
+    let text = resultText
+
+    if text.isEmpty || text == "[BLANK_AUDIO]" {
+        fputs("  chunk \(chunkIndex) [\(speaker)]: [silence]\n", stderr)
+        return
+    }
+
+    // Tinydiarize-trained whisper models emit [SPEAKER_TURN] markers between
+    // segments where the active speaker changes. Only meaningful for THEM
+    // (system audio may carry multiple voices); the mic stream is single-source.
+    let isTdrz = (speaker == "THEM") && text.contains("[SPEAKER_TURN]")
+
+    if isTdrz {
+        let segments = text.components(separatedBy: "[SPEAKER_TURN]")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        for (i, segment) in segments.enumerated() {
+            if isHallucination(segment) {
+                fputs("  chunk \(chunkIndex) seg\(i): [filtered: \(segment.prefix(30))]\n", stderr)
+                continue
+            }
+            // Segment 0 continues the previous speaker (so a single voice
+            // spanning chunk boundaries keeps its label); each subsequent
+            // segment is a new speaker (monotonically increasing index).
+            let idx = (i == 0) ? speakerIndex.current() : speakerIndex.increment()
+            let label = "THEM-\(speakerLetter(idx))"
+            transcriptContext.set(label, text: segment)
+            transcriptMerger.add(timestamp: timestamp, speaker: label, text: segment)
+            fputs("  chunk \(chunkIndex) [\(label)]: \(segment.prefix(70))... (\(elapsed))\n", stderr)
+        }
+        return
+    }
+
+    // Non-tdrz path: THEM uses whatever the diarize-server most recently
+    // returned via the 10s embedding window — either a matched profile name
+    // (e.g. "ALICE") or a cluster label ("THEM-A", "THEM-B", …) for voices
+    // that don't match any enrolled profile. Stays "THEM" only when the
+    // server is unreachable or no window has been processed yet. ME stays ME.
+    if isHallucination(text) {
+        fputs("  chunk \(chunkIndex) [\(speaker)]: [filtered: \(text.prefix(30))]\n", stderr)
+        return
+    }
+
     let finalSpeaker: String
     if speaker == "THEM" {
         let bufferedSpeaker = diarizeBuffer.getCurrentSpeaker()
@@ -575,22 +686,9 @@ func transcribe(wavURL: URL, chunkIndex: Int, speaker: String) {
         finalSpeaker = speaker
     }
 
-    let text = resultText
-    if !text.isEmpty && text != "[BLANK_AUDIO]" && !isHallucination(text) {
-        let elapsed = String(format: "%.1fs", Date().timeIntervalSince(startTime))
-
-        // Save for context carry-over
-        transcriptContext.set(speaker, text: text)
-
-        // Send to merger for sentence-level buffering
-        transcriptMerger.add(timestamp: timestamp, speaker: finalSpeaker, text: text)
-
-        fputs("  chunk \(chunkIndex) [\(finalSpeaker)]: \(text.prefix(70))... (\(elapsed))\n", stderr)
-    } else if isHallucination(text) {
-        fputs("  chunk \(chunkIndex) [\(speaker)]: [filtered: \(text.prefix(30))]\n", stderr)
-    } else {
-        fputs("  chunk \(chunkIndex) [\(speaker)]: [silence]\n", stderr)
-    }
+    transcriptContext.set(speaker, text: text)
+    transcriptMerger.add(timestamp: timestamp, speaker: finalSpeaker, text: text)
+    fputs("  chunk \(chunkIndex) [\(finalSpeaker)]: \(text.prefix(70))... (\(elapsed))\n", stderr)
 }
 
 // MARK: - Stream Delegate
@@ -668,11 +766,66 @@ class CaptureDelegate: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 }
 
+// MARK: - Sample recording (for /profile add)
+
+/// Record N seconds of microphone audio at 16kHz mono and write a WAV file.
+/// Used by /profile add to enroll voice samples — kept here so we don't need
+/// a separate brew dependency (sox/ffmpeg) for recording.
+func recordSample(to path: String, seconds: Double) throws {
+    let engine = AVAudioEngine()
+    let inputNode = engine.inputNode
+    let inputFormat = inputNode.outputFormat(forBus: 0)
+    let targetFormat = AVAudioFormat(
+        commonFormat: .pcmFormatFloat32, sampleRate: sampleRate,
+        channels: 1, interleaved: false
+    )!
+    let converter = AVAudioConverter(from: inputFormat, to: targetFormat)
+
+    let lock = NSLock()
+    var collected: [Float] = []
+
+    inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { inBuffer, _ in
+        guard let converter = converter else { return }
+        let ratio = sampleRate / inputFormat.sampleRate
+        let outFrames = AVAudioFrameCount(Double(inBuffer.frameLength) * ratio)
+        guard let outBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outFrames) else { return }
+        let status = converter.convert(to: outBuffer, error: nil) { _, outStatus in
+            outStatus.pointee = .haveData
+            return inBuffer
+        }
+        if status == .haveData, let floatData = outBuffer.floatChannelData {
+            let s = Array(UnsafeBufferPointer(start: floatData[0], count: Int(outBuffer.frameLength)))
+            lock.lock(); collected.append(contentsOf: s); lock.unlock()
+        }
+    }
+
+    try engine.start()
+    Thread.sleep(forTimeInterval: seconds)
+    engine.stop()
+    inputNode.removeTap(onBus: 0)
+
+    try writeWAV(samples: collected, to: URL(fileURLWithPath: path))
+    fputs("recorded \(collected.count) samples (\(Double(collected.count) / sampleRate)s) → \(path)\n", stderr)
+}
+
 // MARK: - Main
 
 @main
 struct LocalSpeechCapture {
     static func main() async {
+        // Sub-mode: `meetink-capture --record-sample <path> <seconds>`
+        // Records mic audio and exits. Used by /profile add for enrollment.
+        let args = CommandLine.arguments
+        if args.count >= 4 && args[1] == "--record-sample" {
+            do {
+                try recordSample(to: args[2], seconds: Double(args[3]) ?? 5.0)
+                Foundation.exit(0)
+            } catch {
+                fputs("error: \(error.localizedDescription)\n", stderr)
+                Foundation.exit(1)
+            }
+        }
+
         do {
             try await run()
         } catch {
@@ -716,8 +869,16 @@ struct LocalSpeechCapture {
         }
         fputs("whisper-server ready\n", stderr)
 
-        // Initialize transcript file
-        let header = "# Meeting Transcript\nStarted: \(ISO8601DateFormatter().string(from: Date()))\n\n"
+        // Initialize transcript file. The `# user:` line embeds who is
+        // running this session so downstream tooling (titling, /ask) can
+        // map ME-equivalent labels back to a real person without guessing.
+        // titling.sh's _transcript_body() already strips lines starting
+        // with "# " before feeding the model, so this stays out of titles.
+        var header = "# Meeting Transcript\n"
+        if meName != "ME" {
+            header += "# user: \(meName)\n"
+        }
+        header += "Started: \(ISO8601DateFormatter().string(from: Date()))\n\n"
         try header.write(toFile: transcriptPath, atomically: true, encoding: .utf8)
 
         let audioBuffer = AudioBuffer()
@@ -828,7 +989,7 @@ struct LocalSpeechCapture {
                     let wavURL = URL(fileURLWithPath: "\(chunkDir)/chunk_\(idx)_me.wav")
                     try writeWAV(samples: micSamples, to: wavURL)
                     DispatchQueue.global().async {
-                        transcribe(wavURL: wavURL, chunkIndex: idx, speaker: "ME")
+                        transcribe(wavURL: wavURL, chunkIndex: idx, speaker: meName)
                     }
                 }
             }
@@ -852,7 +1013,7 @@ struct LocalSpeechCapture {
         if let micSamples = remaining.mic, hasAudio(micSamples) {
             let wavURL = URL(fileURLWithPath: "\(chunkDir)/chunk_final_me.wav")
             try writeWAV(samples: micSamples, to: wavURL)
-            transcribe(wavURL: wavURL, chunkIndex: idx, speaker: "ME")
+            transcribe(wavURL: wavURL, chunkIndex: idx, speaker: meName)
         }
 
         let footer = "\n---\nEnded: \(ISO8601DateFormatter().string(from: Date()))\n"
