@@ -125,6 +125,60 @@ build_capture() {
     cd - > /dev/null
 }
 
+# --- Build the macOS-native agent ---
+# meetink-agent is a tiny Swift app-bundle that owns the integrations
+# Python can't easily reach: EventKit (calendar reading) and
+# UserNotifications (action-button notifications). It lives at
+# $MK_HOME/bin/MeetinkAgent.app and is invoked one-shot with subcommand
+# arguments. Bundling is required so the app gets a CFBundleIdentifier
+# (com.meetink.agent) — without it, UserNotifications refuses to deliver
+# and EventKit can't request Full Calendar Access.
+build_agent() {
+    print -P "${C[bright_yellow]}▸${C[reset]} Building meetink-agent (calendar + notifications)..."
+    if ! command -v swiftc >/dev/null 2>&1; then
+        print -P "${C[red]}error:${C[reset]} ${C[bold]}swiftc${C[reset]} not found"
+        print -P "  Install Xcode Command Line Tools:"
+        print -P "  ${C[bright_cyan]}xcode-select --install${C[reset]}"
+        exit 1
+    fi
+
+    local sdk
+    if ! sdk=$(find_sdk); then
+        print -P "${C[red]}error:${C[reset]} no macOS SDK found"
+        exit 1
+    fi
+
+    local app="$MK_HOME/bin/MeetinkAgent.app"
+    local macos_dir="$app/Contents/MacOS"
+    local resources_dir="$app/Contents/Resources"
+    mkdir -p "$macos_dir" "$resources_dir"
+
+    swiftc -O -o "$macos_dir/meetink-agent" "$MK_ROOT/src/agent/Sources/main.swift" \
+        -framework Foundation -framework EventKit \
+        -framework UserNotifications -framework AppKit \
+        -framework AVFoundation \
+        -sdk "$sdk" \
+        -target arm64-apple-macosx14.0 || {
+            print -P "${C[red]}error:${C[reset]} agent build failed"
+            exit 1
+        }
+
+    # Drop the Info.plist into Contents/ — UserNotifications won't fire
+    # without CFBundleIdentifier; EventKit's Full Calendar Access prompt
+    # uses the NSCalendarsFullAccessUsageDescription string.
+    cp "$MK_ROOT/src/agent/Resources/Info.plist" "$app/Contents/Info.plist"
+
+    # Ad-hoc sign so macOS gives the bundle a stable identity for TCC
+    # (the permission database) — without this, every rebuild looks
+    # like a different app and the user re-grants Calendar / Notification
+    # permission each time.
+    if command -v codesign >/dev/null 2>&1; then
+        codesign --force --sign - "$app" 2>/dev/null || true
+    fi
+
+    print -P "${C[green]}✓${C[reset]} Built: ${C[dim]}$app${C[reset]}"
+}
+
 # --- Download whisper model ---
 download_model() {
     local model_name="${1:-small.en}"
@@ -332,7 +386,7 @@ cmd_setup() {
     print -P "${C[bright_yellow]}[1/5] whisper.cpp${C[reset]}"
     install_whisper
 
-    # 2. Swift capture binary
+    # 2. Swift capture binary + meetink-agent app bundle
     print -P ""
     print -P "${C[bright_yellow]}[2/5] capture binary${C[reset]}"
     if ! find_capture_binary >/dev/null 2>&1; then
@@ -340,6 +394,10 @@ cmd_setup() {
     else
         print -P "${C[green]}✓${C[reset]} Capture binary present"
     fi
+    # Always rebuild the agent — the Swift source evolves more than the
+    # capture binary, and the build is cheap (~3 s) compared to the cost
+    # of a stale agent dispatching a notification with the wrong fields.
+    build_agent
 
     # 3. Whisper model picker (still interactive — the user genuinely cares
     # which language/quality tier to install, and small.en isn't always the
