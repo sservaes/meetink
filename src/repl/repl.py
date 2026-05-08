@@ -893,7 +893,10 @@ def _build_ask_prompt(
         "doesn't contain enough information to answer, say so plainly rather "
         "than speculating. When past meetings from the same project are "
         "provided, you may reference them — they appear newest first, with "
-        "older entries condensed; the most recent are most relevant."
+        "older entries condensed; the most recent are most relevant. When "
+        "earlier turns in the current conversation are provided, treat them "
+        "as the active thread — the user may be asking a follow-up that "
+        "depends on what you said before."
     )
 
     parts = []
@@ -915,6 +918,11 @@ def _build_ask_prompt(
             f"condensed or heading-only by recency):\n\n{past_meetings}"
         )
     parts.append(f"Current meeting transcript (file: {transcript_path.name}):\n{transcript_text}")
+    if ask_history:
+        parts.append(
+            "Earlier in this conversation (most recent last; the user may be "
+            f"asking a follow-up):\n\n{ask_history}"
+        )
     parts.append(f"Question from the user: {question}")
     user = "\n\n".join(parts)
 
@@ -922,6 +930,7 @@ def _build_ask_prompt(
         "doc_count": len(_context_doc_pairs()),
         "used_summaries": prefer_summaries,
         "had_past_meetings": bool(past_meetings),
+        "had_ask_history": bool(ask_history),
     }
     return system, user, stats
 
@@ -1054,6 +1063,10 @@ def _try_handle_ask_local(question: str) -> bool:
         )
 
     def worker():
+        # Accumulate the visible (non-think) text so we can persist the
+        # finished answer into MLXRuntime's ask history. Follow-up /asks
+        # in the same session then see the prior Q&A as a thread.
+        answer_buf: list[str] = []
         try:
             # Stream tokens via print_formatted_text — patch_stdout-aware,
             # so they render above the still-live prompt + footer. Buffer
@@ -1080,6 +1093,7 @@ def _try_handle_ask_local(question: str) -> bool:
                         line = line.split("</think>", 1)[1]
                     if not in_think:
                         print_formatted_text(ANSI(line))
+                        answer_buf.append(line)
                 # Force a redraw per chunk so the user sees streaming, not
                 # 1-second bursts at refresh_interval. invalidate is a no-op
                 # if the app isn't running (race during teardown).
@@ -1090,6 +1104,10 @@ def _try_handle_ask_local(question: str) -> bool:
             # Flush any trailing partial line.
             if buffer and not in_think:
                 print_formatted_text(ANSI(buffer))
+                answer_buf.append(buffer)
+            # Save into the thread for follow-ups. Cancelled / empty
+            # streams are skipped by add_ask_pair itself.
+            runtime.add_ask_pair(question, "\n".join(answer_buf))
         except RuntimeError as e:
             print_formatted_text(ANSI(f"\033[31merror:\033[0m {e}"))
         except Exception as e:
@@ -1137,6 +1155,13 @@ def handle_command(line: str) -> bool:
         # support this), \033[H homes the cursor.
         sys.stdout.write("\033[2J\033[3J\033[H")
         sys.stdout.flush()
+        # Drop any in-session /ask thread so the next /ask starts a new
+        # conversation. Mirrors the visual reset of clearing the screen.
+        try:
+            from llm.mlx_runtime import get_runtime
+            get_runtime().clear_ask_history()
+        except ImportError:
+            pass
         # Re-render the welcome banner so /clear feels like a fresh start.
         # No capture_output — let the launcher write directly to the terminal
         # so tput cols sees the real width and the banner renders full-size.
