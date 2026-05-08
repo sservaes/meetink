@@ -1,60 +1,139 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 320" width="1200" height="320" font-family="ui-monospace, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 760" width="1600" height="760"
+     font-family="ui-monospace, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace"
+     role="img" aria-labelledby="title desc">
   <title id="title">meetink — local-first meeting transcription for macOS</title>
-  <desc id="desc">A terminal-style banner showing the meetink wordmark, a sample transcript with three speakers (STIJN, ALICE, BOB), and a status footer.</desc>
+  <desc id="desc">A terminal screenshot of meetink's welcome screen: the MEETINK block-letter wordmark in cyan, a personalised greeting, tips and status columns, and a status footer with model, project, profile, titling, indexer, memory, and context-bar chips.</desc>
 
-  <!-- Terminal window -->
-  <rect x="0" y="0" width="1200" height="320" rx="12" ry="12" fill="#0d1117"/>
-
-  <!-- Title bar -->
-  <path d="M0,12 a12,12 0 0 1 12,-12 h1176 a12,12 0 0 1 12,12 v24 h-1200 z" fill="#161b22"/>
-  <line x1="0" y1="36" x2="1200" y2="36" stroke="#21262d" stroke-width="1"/>
+  <!-- macOS terminal window chrome -->
+  <rect x="0" y="0" width="1600" height="760" rx="14" ry="14" fill="#1c1c1c"/>
+  <path d="M0,14 a14,14 0 0 1 14,-14 h1572 a14,14 0 0 1 14,14 v32 h-1600 z" fill="#2a2a2a"/>
+  <line x1="0" y1="46" x2="1600" y2="46" stroke="#3a3a3a" stroke-width="1"/>
 
   <!-- Traffic lights -->
-  <circle cx="22" cy="18" r="6" fill="#ff5f56"/>
-  <circle cx="44" cy="18" r="6" fill="#ffbd2e"/>
-  <circle cx="66" cy="18" r="6" fill="#27c93f"/>
+  <circle cx="24" cy="23" r="7" fill="#ff5f56"/>
+  <circle cx="46" cy="23" r="7" fill="#ffbd2e"/>
+  <circle cx="68" cy="23" r="7" fill="#27c93f"/>
 
   <!-- Title bar label -->
-  <text x="600" y="23" fill="#8b949e" font-size="12" text-anchor="middle">meetink — ~/Documents/meetink/acme-corp</text>
+  <text x="800" y="28" fill="#9a9a9a" font-size="13" text-anchor="middle">Documents — python ◂ meetink</text>
 
-  <!-- Wordmark -->
-  <text x="32" y="100" fill="#7ee787" font-size="56" font-weight="700" letter-spacing="-1">meetink</text>
-  <text x="32" y="128" fill="#8b949e" font-size="14">local-first meeting transcription · macOS · Apple Silicon · 100% on-device</text>
+  <!-- Welcome panel: rounded box echoing the boxed REPL banner -->
+  <rect x="36" y="78" width="1528" height="478" rx="10" ry="10"
+        fill="none" stroke="#3a3a3a" stroke-width="1.4"/>
+  <!-- Panel label punched through the top border -->
+  <rect x="58" y="70" width="140" height="18" fill="#1c1c1c"/>
+  <text x="68" y="85" fill="#7a7a7a" font-size="13">meetink v0.1.0</text>
 
-  <!-- Transcript sample -->
-  <g font-size="15">
-    <text x="32"  y="178" fill="#58a6ff">[14:32:08]</text>
-    <text x="138" y="178" fill="#f0f6fc">STIJN:</text>
-    <text x="208" y="178" fill="#c9d1d9">yeah I think we should ship it next week</text>
-
-    <text x="32"  y="206" fill="#58a6ff">[14:32:14]</text>
-    <text x="138" y="206" fill="#f0f6fc">ALICE:</text>
-    <text x="208" y="206" fill="#c9d1d9">agreed, let's get the design review on the calendar</text>
-
-    <text x="32"  y="234" fill="#58a6ff">[14:32:21]</text>
-    <text x="138" y="234" fill="#f0f6fc">BOB:</text>
-    <text x="208" y="234" fill="#c9d1d9">I can take action item on the marketing site</text>
+  <!-- MEETINK block-letter wordmark (ANSI Shadow) — same characters welcome.sh emits -->
+  <g font-size="22" fill="#5fdfff" font-weight="700"
+     style="white-space: pre">
+    <text x="320" y="148">███╗   ███╗███████╗███████╗████████╗██╗███╗   ██╗██╗  ██╗</text>
+    <text x="320" y="174">████╗ ████║██╔════╝██╔════╝╚══██╔══╝██║████╗  ██║██║ ██╔╝</text>
+    <text x="320" y="200">██╔████╔██║█████╗  █████╗     ██║   ██║██╔██╗ ██║█████╔╝ </text>
+    <text x="320" y="226">██║╚██╔╝██║██╔══╝  ██╔══╝     ██║   ██║██║╚██╗██║██╔═██╗ </text>
+    <text x="320" y="252">██║ ╚═╝ ██║███████╗███████╗   ██║   ██║██║ ╚████║██║  ██╗</text>
+    <text x="320" y="278">╚═╝     ╚═╝╚══════╝╚══════╝   ╚═╝   ╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝</text>
   </g>
 
-  <!-- Footer divider -->
-  <line x1="32" y1="262" x2="1168" y2="262" stroke="#21262d" stroke-width="1"/>
+  <!-- Personalised greeting -->
+  <g font-size="18">
+    <text x="84" y="332" fill="#f0f0f0" font-weight="700">Hi <tspan fill="#5fdfff">Stijn</tspan><tspan fill="#9a9a9a" font-weight="400"> — every meeting, inked locally.</tspan></text>
+  </g>
 
-  <!-- Status footer -->
-  <g font-size="13">
-    <text x="32" y="284" fill="#8b949e">qwen3.5-2b  ·  acme-corp  ·  STIJN  ·  local titling</text>
-    <text x="32" y="304" fill="#8b949e"><tspan fill="#3fb950">●</tspan>  recording 02:14  ·  24 lines  ·  context</text>
-    <!-- Context bar: 8 segments, 5 filled (gradient green→yellow), 3 dim -->
-    <g>
-      <rect x="278" y="294" width="12" height="12" fill="#39d353"/>
-      <rect x="293" y="294" width="12" height="12" fill="#52d35b"/>
-      <rect x="308" y="294" width="12" height="12" fill="#7ee787"/>
-      <rect x="323" y="294" width="12" height="12" fill="#a3e635"/>
-      <rect x="338" y="294" width="12" height="12" fill="#facc15"/>
-      <rect x="353" y="294" width="12" height="12" fill="#21262d"/>
-      <rect x="368" y="294" width="12" height="12" fill="#21262d"/>
-      <rect x="383" y="294" width="12" height="12" fill="#21262d"/>
+  <!-- Tips column -->
+  <g font-size="16">
+    <text x="84"  y="386" fill="#ffd866" font-weight="700">Tips for getting started</text>
+    <text x="84"  y="416" fill="#9a9a9a">•</text>
+    <text x="106" y="416" fill="#62d96b">All set.</text>
+    <text x="190" y="416" fill="#d6d6d6">Dependencies installed.</text>
+    <text x="84"  y="442" fill="#9a9a9a">•</text>
+    <text x="106" y="442" fill="#d6d6d6">Type</text>
+    <text x="156" y="442" fill="#5fdfff">`/start`</text>
+    <text x="240" y="442" fill="#d6d6d6">to begin transcribing</text>
+    <text x="84"  y="468" fill="#9a9a9a">•</text>
+    <text x="106" y="468" fill="#d6d6d6">Type</text>
+    <text x="156" y="468" fill="#5fdfff">`/help`</text>
+    <text x="234" y="468" fill="#d6d6d6">for all commands</text>
+  </g>
+
+  <!-- Status column -->
+  <g font-size="16">
+    <text x="820" y="386" fill="#ffd866" font-weight="700">Status</text>
+    <g fill="#62d96b" font-size="18">
+      <text x="820"  y="416">●</text>
+      <text x="996"  y="416">●</text>
+      <text x="1226" y="416">●</text>
+      <text x="820"  y="450">●</text>
+      <text x="996"  y="450">●</text>
     </g>
-    <text x="403" y="304" fill="#facc15">62%</text>
-    <text x="438" y="304" fill="#8b949e">16K</text>
+    <g fill="#d6d6d6">
+      <text x="844"  y="416">capture binary</text>
+      <text x="1020" y="416">whisper model</text>
+      <text x="1250" y="416">whisper-cpp</text>
+      <text x="844"  y="450">speaker ID</text>
+      <text x="1020" y="450">Qwen3.5-2B titling</text>
+    </g>
+  </g>
+
+  <!-- Below-panel byline -->
+  <text x="36" y="592" fill="#7a7a7a" font-size="14">
+    Made for macOS  ·  Apple Silicon optimized  ·  ~/.meetink
+  </text>
+
+  <!-- Idle help row -->
+  <g font-size="14" fill="#9a9a9a">
+    <text x="36" y="624">Type /help for commands. Tab to autocomplete.</text>
+    <text x="36" y="646">Tip: /watch on  ·  auto-record meetings from your calendar (and impromptu calls).</text>
+  </g>
+
+  <!-- Prompt -->
+  <g font-size="15">
+    <text x="36" y="688" fill="#5fdfff">meetink</text>
+    <text x="118" y="688" fill="#7a7a7a">○</text>
+    <text x="138" y="688" fill="#9a9a9a">›</text>
+  </g>
+
+  <!-- Status bar background -->
+  <rect x="0" y="710" width="1600" height="50" fill="#161616"/>
+  <line x1="0" y1="710" x2="1600" y2="710" stroke="#2a2a2a" stroke-width="1"/>
+
+  <!-- Footer: chips line -->
+  <g font-size="14">
+    <text x="36"   y="732" fill="#d6d6d6">🎤 small.en</text>
+    <text x="160"  y="732" fill="#7a7a7a">|</text>
+    <text x="178"  y="732" fill="#d6d6d6">📁 ~/Documents/meetink/acme-corp</text>
+    <text x="492"  y="732" fill="#7a7a7a">|</text>
+    <text x="510"  y="732" fill="#d6d6d6">📦 <tspan fill="#d96bff">acme-corp</tspan></text>
+    <text x="652"  y="732" fill="#7a7a7a">|</text>
+    <text x="670"  y="732" fill="#d6d6d6">👤 2 profiles</text>
+    <text x="790"  y="732" fill="#7a7a7a">|</text>
+    <text x="808"  y="732" fill="#d6d6d6">✨ Qwen3.5-2B</text>
+    <text x="942"  y="732" fill="#7a7a7a">|</text>
+    <text x="960"  y="732" fill="#d6d6d6">📚 <tspan fill="#62d96b">ready</tspan></text>
+    <text x="1052" y="732" fill="#7a7a7a">|</text>
+    <text x="1070" y="732" fill="#d6d6d6">🧠 16GB <tspan fill="#7a7a7a">·</tspan> 4.9GB free</text>
+  </g>
+
+  <!-- Footer: state + context bar line -->
+  <g font-size="14">
+    <text x="36"  y="752" fill="#7a7a7a">○</text>
+    <text x="54"  y="752" fill="#9a9a9a">idle</text>
+    <text x="98"  y="752" fill="#7a7a7a">|</text>
+    <text x="116" y="752" fill="#9a9a9a">context</text>
+    <!-- 8-cell context bar at 0% (all dim) -->
+    <g>
+      <rect x="180" y="742" width="11" height="11" fill="#3a3a3a"/>
+      <rect x="194" y="742" width="11" height="11" fill="#3a3a3a"/>
+      <rect x="208" y="742" width="11" height="11" fill="#3a3a3a"/>
+      <rect x="222" y="742" width="11" height="11" fill="#3a3a3a"/>
+      <rect x="236" y="742" width="11" height="11" fill="#3a3a3a"/>
+      <rect x="250" y="742" width="11" height="11" fill="#3a3a3a"/>
+      <rect x="264" y="742" width="11" height="11" fill="#3a3a3a"/>
+      <rect x="278" y="742" width="11" height="11" fill="#3a3a3a"/>
+    </g>
+    <text x="298" y="752" fill="#62d96b">0%</text>
+    <text x="326" y="752" fill="#9a9a9a">16K</text>
+    <text x="370" y="752" fill="#7a7a7a">|</text>
+    <text x="388" y="752" fill="#9a9a9a">/start to record  ·  /help for commands</text>
   </g>
 </svg>
