@@ -1,15 +1,25 @@
-"""WatchManager — auto-record meetings from your calendar.
+"""WatchManager — auto-record meetings from your calendar AND impromptu
+calls that start without one.
 
 Long-running thread that polls Calendar.app every 60 s, schedules
 1-min-before notifications with Skip action, drives /start /stop in
 response to event boundaries + meeting-active signals.
+
+Two recording paths:
+  - Scheduled: a calendar event approaches → 1-min warning → record at
+    start time → end when conferencing app stays absent for 2 min.
+  - Instant:   meeting-active flips true outside any scheduled window,
+    stable for one 30 s poll → confirmation notification (Skip option,
+    default = record after 60 s) → recording for the same end criteria.
+    Skipping an instant meeting installs a 30-min cooldown so re-joining
+    the same call doesn't re-prompt.
 
 Lifecycle:
   start()      spawn the watcher thread (idempotent)
   stop()       signal exit; an in-flight recording is NOT stopped
   is_running() / status_summary() / skip_next() for the REPL surface
 
-State per event (keyed by stable EventKit id):
+State per event (keyed by stable EventKit id, or `instant-<ts>`):
 
   pending    — in calendar, hasn't fired yet
   notified   — 1-min warning sent; recording will start at event time
@@ -29,6 +39,9 @@ Switching policy:
     don't trigger a false stop).
   - When a recording ends, we re-evaluate deferred events: if any are
     still in their window, the highest-scored one starts.
+  - Instant detection is suppressed while a scheduled event is in its
+    notification/recording window (or within 2 min of starting) so the
+    scheduled flow always wins.
 """
 
 from __future__ import annotations
@@ -65,6 +78,25 @@ EXPIRE_AFTER_END_S = 600      # 10 min past end with no record = expired
 # a real recording, while still catching post-meeting cleanup quickly.
 MEETING_END_QUIET_TICKS = 4
 
+# Instant-meeting detection.
+#   CONFIRM_TICKS    — consecutive active polls before fire. 1 = 30 s of
+#                       stable activity. Lower numbers catch calls faster
+#                       but raise the false-positive risk of brief mic
+#                       tests / "joining to check audio" actions.
+#   SCHEDULED_BUFFER — don't trip instant detection if a scheduled event
+#                       starts within this many seconds (the scheduled
+#                       path owns it).
+#   SKIP_COOLDOWN    — after Skip on an instant notification, suppress
+#                       further instant detection for this long. Without
+#                       it, the same call would re-prompt every 30 s.
+#   END_COOLDOWN     — after an instant recording stops, suppress
+#                       re-detection. Catches users wrapping a call where
+#                       the conferencing app re-activates briefly.
+INSTANT_CONFIRM_TICKS = 1
+INSTANT_SCHEDULED_BUFFER_S = 120
+INSTANT_SKIP_COOLDOWN_S = 1800
+INSTANT_END_COOLDOWN_S = 300
+
 
 class EventStatus(Enum):
     PENDING = "pending"
@@ -91,6 +123,10 @@ class WatchedEvent:
     notified_at: Optional[datetime] = None
     recorded_at: Optional[datetime] = None
     project: Optional[str] = None  # resolved by router at notify time
+    # Set on synthetic events created for instant meetings. None for
+    # calendar-backed events. Populated with the source label
+    # (zoom/meet/teams/webex/...) the agent flagged at detection.
+    detected_source: Optional[str] = None
 
     def score(self) -> int:
         """Higher = more deserving of being recorded when conflicting
@@ -229,6 +265,17 @@ class WatchManager:
         self._inactive_streak: int = 0
         self._last_calendar_poll: float = 0.0
         self._last_active_poll: float = 0.0
+        # Instant detection state. _instant_streak counts consecutive
+        # active polls; _instant_pending guards against double-firing
+        # the confirmation notification while a worker is still waiting
+        # for a click. Cooldowns suppress detection after Skip / end.
+        self._instant_streak: int = 0
+        self._instant_pending: bool = False
+        self._last_meeting_active: dict = {
+            "active": False, "source": None, "signals": [],
+        }
+        self._skip_cooldown_until: float = 0.0
+        self._end_cooldown_until: float = 0.0
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -240,7 +287,14 @@ class WatchManager:
             if self.is_running():
                 return False
             self._stop_event.clear()
+            # Reset transient state so a stop/start cycle clears any
+            # leftover cooldowns (a user may /watch off after misclicking
+            # Skip; restarting should let detection trigger again).
             self._inactive_streak = 0
+            self._instant_streak = 0
+            self._instant_pending = False
+            self._skip_cooldown_until = 0.0
+            self._end_cooldown_until = 0.0
             self._thread = threading.Thread(
                 target=self._loop, name="meetink-watch", daemon=True,
             )
@@ -269,15 +323,16 @@ class WatchManager:
                  and e.end > now],
                 key=lambda e: e.start,
             )
+            rec_ev = (
+                self._events.get(self._currently_recording)
+                if self._currently_recording else None
+            )
             return {
                 "running": self.is_running(),
                 "recording_id": self._currently_recording,
-                "recording_title": (
-                    self._events[self._currently_recording].title
-                    if self._currently_recording
-                       and self._currently_recording in self._events
-                    else None
-                ),
+                "recording_title": rec_ev.title if rec_ev else None,
+                "recording_source": rec_ev.detected_source if rec_ev else None,
+                "instant_pending": self._instant_pending,
                 "upcoming": [
                     {
                         "id": e.id,
@@ -343,11 +398,20 @@ class WatchManager:
                 if 0 < lead <= NOTIFY_LEAD_S:
                     self._fire_notification(e)
 
+        # Single meeting-active poll per ACTIVE_POLL_S window. Result
+        # cached on the manager; both end-detection (currently recording)
+        # and instant-detection (idle) consume it. Maintains the
+        # _inactive_streak / _instant_streak counters in lockstep.
+        if now_wall - self._last_active_poll > ACTIVE_POLL_S:
+            self._poll_meeting_active()
+
         # Recording start/stop based on event boundaries + meeting-active.
         # Done outside the lock when possible (subprocess calls).
         self._maybe_start_recording(now)
         if self._currently_recording is not None:
             self._maybe_end_recording(now, now_wall)
+        else:
+            self._maybe_start_instant_recording(now, now_wall)
 
         # Expire events whose window has long passed and never recorded.
         with self._lock:
@@ -356,6 +420,24 @@ class WatchManager:
                                 EventStatus.DEFERRED):
                     if (now - e.end).total_seconds() > EXPIRE_AFTER_END_S:
                         e.status = EventStatus.EXPIRED
+
+    # -- meeting-active polling --------------------------------------------
+
+    def _poll_meeting_active(self) -> None:
+        """One agent shell-out per ACTIVE_POLL_S. Updates both streak
+        counters atomically so they stay consistent with each other —
+        active poll increments _instant_streak / resets _inactive_streak,
+        inactive poll does the opposite."""
+        result = _agent_meeting_active()
+        with self._lock:
+            self._last_active_poll = time.time()
+            self._last_meeting_active = result
+            if result.get("active"):
+                self._inactive_streak = 0
+                self._instant_streak += 1
+            else:
+                self._inactive_streak += 1
+                self._instant_streak = 0
 
     # -- calendar refresh ---------------------------------------------------
 
@@ -521,19 +603,14 @@ class WatchManager:
     # -- recording end ----------------------------------------------------
 
     def _maybe_end_recording(self, now: datetime, now_wall: float) -> None:
-        """Poll meeting-active. End the recording when the conferencing
-        app has been absent for MEETING_END_QUIET_TICKS consecutive
-        polls. Process detection > silence detection — brainstorm
-        gaps don't false-positive."""
-        if now_wall - self._last_active_poll < ACTIVE_POLL_S:
-            return
-        result = _agent_meeting_active()
+        """Decide whether to stop the current recording. Reads the
+        cached _inactive_streak (maintained by _poll_meeting_active),
+        so this is cheap to call every loop tick.
+
+        Process detection > silence detection — brainstorm gaps don't
+        false-positive (we end only when the conferencing app has been
+        absent for MEETING_END_QUIET_TICKS consecutive 30 s polls)."""
         with self._lock:
-            self._last_active_poll = now_wall
-            if result.get("active"):
-                self._inactive_streak = 0
-                return
-            self._inactive_streak += 1
             if self._inactive_streak < MEETING_END_QUIET_TICKS:
                 return
             recording_id = self._currently_recording
@@ -541,10 +618,143 @@ class WatchManager:
         # Drop the lock to shell out /stop
         _stop_recording_subprocess()
         with self._lock:
+            was_instant = False
             if recording_id and recording_id in self._events:
-                self._events[recording_id].status = EventStatus.COMPLETED
+                ev = self._events[recording_id]
+                ev.status = EventStatus.COMPLETED
+                was_instant = ev.detected_source is not None
             self._currently_recording = None
             self._inactive_streak = 0
+            self._instant_streak = 0
+            # Brief blips after wrap-up (e.g. user switches Zoom windows
+            # while saying goodbye) shouldn't immediately re-arm instant
+            # detection on the same call.
+            if was_instant:
+                self._end_cooldown_until = (
+                    time.time() + INSTANT_END_COOLDOWN_S
+                )
+
+    # -- instant-meeting detection ----------------------------------------
+
+    def _maybe_start_instant_recording(
+        self, now: datetime, now_wall: float
+    ) -> None:
+        """Detect calls that start without a calendar event and offer
+        to record. Suppressed during scheduled-event windows + cooldowns;
+        requires INSTANT_CONFIRM_TICKS active polls before firing.
+
+        Notification is fire-and-forget: a worker thread blocks on the
+        agent until the user clicks Skip or the timeout expires (default
+        = record). _instant_pending guards against re-entry while the
+        user is still deciding."""
+        with self._lock:
+            if self._instant_pending:
+                return
+            if now_wall < self._skip_cooldown_until:
+                return
+            if now_wall < self._end_cooldown_until:
+                return
+            # Don't compete with the scheduled path. Anything notified /
+            # deferred / recording owns the moment; anything pending
+            # within INSTANT_SCHEDULED_BUFFER_S of starting also does
+            # (it's about to claim the next minute anyway).
+            for e in self._events.values():
+                if e.status in (EventStatus.NOTIFIED, EventStatus.DEFERRED,
+                                EventStatus.RECORDING):
+                    return
+                if e.status == EventStatus.PENDING:
+                    until_start = (e.start - now).total_seconds()
+                    if 0 < until_start < INSTANT_SCHEDULED_BUFFER_S:
+                        return
+
+            if self._instant_streak < INSTANT_CONFIRM_TICKS:
+                return
+            active = self._last_meeting_active
+            if not active.get("active"):
+                return
+
+            # Reserve the slot. Reset streak so a Skip-then-stay-in-call
+            # doesn't immediately re-arm; the cooldown set by the worker
+            # is what governs re-entry from here on.
+            self._instant_pending = True
+            self._instant_streak = 0
+            source = active.get("source") or "meeting"
+            signals = list(active.get("signals", []))
+
+            instant_id = f"instant-{int(now_wall)}"
+            ev = WatchedEvent(
+                id=instant_id,
+                title="(instant meeting)",
+                start=now,
+                # Big window so EXPIRE_AFTER_END_S never trips while the
+                # call is in flight. Real end is driven by meeting-active.
+                end=now + timedelta(hours=8),
+                attendees=[],
+                rsvp_status="none",
+                location="",
+                notes=f"detected via {', '.join(signals)}" if signals else "",
+                calendar_title="",
+                status=EventStatus.NOTIFIED,
+                notified_at=now,
+                detected_source=source,
+            )
+            self._events[instant_id] = ev
+
+        body = f"Detected {source} call. Recording in 60 s — Skip to ignore."
+
+        def worker() -> None:
+            response = _agent_notify(
+                title="meetink — instant meeting",
+                body=body,
+                actions=["Skip"],
+                default="Continue",
+                timeout=NOTIFY_TIMEOUT_S,
+            )
+            if response.strip().lower() == "skip":
+                with self._lock:
+                    ev.status = EventStatus.SKIPPED
+                    self._skip_cooldown_until = (
+                        time.time() + INSTANT_SKIP_COOLDOWN_S
+                    )
+                    self._instant_pending = False
+                return
+
+            # Default / Continue / timeout → record. Re-check that we
+            # aren't now blocked by a scheduled recording that started
+            # while the user was deciding.
+            with self._lock:
+                if self._currently_recording is not None:
+                    ev.status = EventStatus.EXPIRED
+                    self._instant_pending = False
+                    return
+
+            env_extras = self._instant_metadata_env(ev)
+            ok = _start_recording_subprocess(env_extras)
+            with self._lock:
+                if ok:
+                    ev.status = EventStatus.RECORDING
+                    ev.recorded_at = _now()
+                    self._currently_recording = ev.id
+                    self._inactive_streak = 0
+                else:
+                    ev.status = EventStatus.EXPIRED
+                self._instant_pending = False
+
+        threading.Thread(target=worker, daemon=True,
+                         name="meetink-instant").start()
+
+    def _instant_metadata_env(self, e: WatchedEvent) -> dict[str, str]:
+        """Header env for instant recordings. Skips scheduled-only
+        fields (start/end/attendees/etc.) so the transcript header
+        doesn't carry misleading values; the capture binary writes
+        its own `Started:` line which is the truthful timestamp."""
+        return {
+            "MEETINK_EVENT_TITLE":   e.title,
+            "MEETINK_EVENT_INSTANT": "true",
+            "MEETINK_EVENT_SOURCE":  e.detected_source or "",
+            "MEETINK_EVENT_NOTES":   e.notes,
+            "MEETINK_EVENT_PROJECT": e.project or "",
+        }
 
 
 def get_manager() -> WatchManager:

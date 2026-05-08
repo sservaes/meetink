@@ -1597,7 +1597,12 @@ def _handle_watch_inproc(args: list[str]) -> bool:
             emit("  \033[90m○\033[0m  /watch: \033[90midle\033[0m")
         if snap.get("recording_id"):
             title = snap.get("recording_title") or "(unknown)"
-            emit(f"  \033[2m  recording:\033[0m  \033[1m{title}\033[0m")
+            src = snap.get("recording_source")
+            tag = f" \033[35m· {src}\033[0m" if src else ""
+            emit(f"  \033[2m  recording:\033[0m  \033[1m{title}\033[0m{tag}")
+        elif snap.get("instant_pending"):
+            emit("  \033[33m  pending:\033[0m  instant meeting "
+                 "(awaiting confirmation)")
         upcoming = snap.get("upcoming", [])
         if upcoming:
             emit("")

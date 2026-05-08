@@ -887,6 +887,8 @@ struct LocalSpeechCapture {
         let env = ProcessInfo.processInfo.environment
         let metadataKeys: [(envKey: String, headerKey: String)] = [
             ("MEETINK_EVENT_TITLE",     "event"),
+            ("MEETINK_EVENT_INSTANT",   "instant"),
+            ("MEETINK_EVENT_SOURCE",    "source"),
             ("MEETINK_EVENT_START",     "scheduled_start"),
             ("MEETINK_EVENT_END",       "scheduled_end"),
             ("MEETINK_EVENT_ATTENDEES", "attendees"),
