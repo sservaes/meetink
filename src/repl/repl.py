@@ -905,6 +905,11 @@ _NESTED_COMMANDS = {
         "rm": _context_names_completer,
         "show": _context_names_completer,
     },
+    "/index": {
+        "status": None,
+        "install": None,
+        "rm": None,
+    },
 }
 
 
