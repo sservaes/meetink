@@ -21,20 +21,52 @@
 #
 # Sourced by bin/meetink AFTER repl.sh, context.sh.
 
-# sentence-transformers + its torch dep is the bulk of the install.
-# We intentionally don't pre-install in /setup — most users won't ask
-# questions about long meetings. /index install is opt-in.
-INDEX_INSTALL_PYDEPS="sentence-transformers"
+# fastembed is an ONNX-backed embedder (~50 MB install, no torch). We
+# previously used sentence-transformers, but its torch + transformers
+# stack hit a NameError regression in transformers/integrations/
+# accelerate.py at module import that crashed the REPL on Apple Silicon.
+# fastembed bundles bge-small as ONNX, runs via onnxruntime, and avoids
+# the entire torch import path.
+INDEX_INSTALL_PYDEPS="fastembed"
 
 
 index_available() {
+    # Use a tolerant check: any exception during import counts as
+    # "not available", not just ModuleNotFoundError. A broken stack
+    # (e.g. legacy sentence-transformers leftovers) shouldn't be
+    # reported as installed.
     [[ -x "$MK_PY_VENV/bin/python" ]] && \
-        "$MK_PY_VENV/bin/python" -c "import sentence_transformers" 2>/dev/null
+        "$MK_PY_VENV/bin/python" -c \
+        "
+try:
+    import fastembed
+except Exception:
+    raise SystemExit(1)
+" 2>/dev/null
 }
 
 
-# Install sentence-transformers into the REPL venv. ~700 MB pulled by
-# torch; bge-small (~80 MB) downloads on first encode() call.
+# Detect a legacy sentence-transformers install so we can clean it up
+# during /index install. Two reasons to remove it: free ~700 MB of disk
+# (torch + transformers), and avoid future confusion if the import
+# regression resurfaces.
+_index_has_legacy_st() {
+    [[ -x "$MK_PY_VENV/bin/python" ]] && \
+        "$MK_PY_VENV/bin/python" -c "import sentence_transformers" 2>/dev/null
+    # Also catches a half-broken install where the package directory
+    # exists but the import errors out — uv's metadata is the source
+    # of truth, so check that.
+    if [[ $? -ne 0 ]]; then
+        # Import failed; check the metadata directly.
+        "$MK_PY_VENV/bin/python" -c \
+            "import importlib.metadata as m; m.version('sentence-transformers')" \
+            2>/dev/null
+    fi
+}
+
+
+# Install fastembed into the REPL venv. ~50 MB; bge-small.onnx (~80 MB)
+# downloads on first encode() call into ~/.cache/fastembed.
 index_install() {
     if [[ ! -x "$MK_PY_VENV/bin/python" ]]; then
         print -P "${C[red]}error:${C[reset]} REPL Python venv missing — run ${C[bright_cyan]}meetink setup${C[reset]} first"
@@ -48,24 +80,35 @@ index_install() {
         print -P "${C[red]}error:${C[reset]} uv not found — run ${C[bright_cyan]}meetink setup${C[reset]} first"
         return 1
     fi
-    print -P "${C[bright_yellow]}▸${C[reset]} Installing index dependencies ${C[dim]}(~700 MB with torch)...${C[reset]}"
+
+    # Migrate away from the legacy sentence-transformers stack if
+    # present. This frees ~700 MB and removes the broken transformers
+    # import path that crashed the REPL on previous installs.
+    if _index_has_legacy_st >/dev/null 2>&1; then
+        print -P "${C[bright_yellow]}▸${C[reset]} Removing legacy sentence-transformers install ${C[dim]}(~700 MB freed)...${C[reset]}"
+        uv pip uninstall --python "$MK_PY_VENV/bin/python" \
+            sentence-transformers torch transformers tokenizers safetensors \
+            2>/dev/null || true
+    fi
+
+    print -P "${C[bright_yellow]}▸${C[reset]} Installing index dependencies ${C[dim]}(~50 MB, ONNX-based)...${C[reset]}"
     if ! uv pip install --python "$MK_PY_VENV/bin/python" --quiet \
             $INDEX_INSTALL_PYDEPS; then
         print -P "${C[red]}error:${C[reset]} install failed"
         return 1
     fi
-    print -P "${C[green]}✓${C[reset]} sentence-transformers installed"
-    print -P "  ${C[dim]}bge-small (~80 MB) will download on first /start.${C[reset]}"
+    print -P "${C[green]}✓${C[reset]} fastembed installed"
+    print -P "  ${C[dim]}bge-small.onnx (~80 MB) will download on first /start.${C[reset]}"
 }
 
 
 # Show install state + per-project index summary.
 index_status() {
     if index_available; then
-        print -P "${C[green]}✓${C[reset]} Index ${C[bold]}available${C[reset]} ${C[dim]}(sentence-transformers in $MK_PY_VENV/bin)${C[reset]}"
+        print -P "${C[green]}✓${C[reset]} Index ${C[bold]}available${C[reset]} ${C[dim]}(fastembed in $MK_PY_VENV/bin)${C[reset]}"
     else
         print -P "${C[dim]}Index dependencies not installed.${C[reset]}"
-        print -P "  Run ${C[bright_cyan]}/index install${C[reset]} ${C[dim]}(~700 MB; enables RAG-backed /ask on long meetings)${C[reset]}"
+        print -P "  Run ${C[bright_cyan]}/index install${C[reset]} ${C[dim]}(~50 MB; enables RAG-backed /ask on long meetings)${C[reset]}"
         return 0
     fi
 
@@ -106,17 +149,17 @@ index_status() {
 index_remove() {
     local arg="$1"
     if [[ "$arg" == "deps" || "$arg" == "uninstall" ]]; then
-        if ! index_available; then
-            print -P "${C[dim]}sentence-transformers not installed.${C[reset]}"
-            return 0
-        fi
-        print -nP "Uninstall sentence-transformers + torch from the REPL venv? ${C[dim]}(y/N)${C[reset]}: "
+        # Best-effort cleanup: remove fastembed + the legacy ST stack
+        # in case the user is migrating from a half-installed state.
+        print -nP "Uninstall index dependencies (fastembed + any legacy stack)? ${C[dim]}(y/N)${C[reset]}: "
         local confirm; read confirm
         [[ "$confirm" != "y" && "$confirm" != "Y" ]] && {
             print -P "${C[dim]}cancelled${C[reset]}"; return 0
         }
-        uv pip uninstall --python "$MK_PY_VENV/bin/python" --quiet \
-            sentence-transformers torch transformers 2>/dev/null
+        uv pip uninstall --python "$MK_PY_VENV/bin/python" \
+            fastembed onnxruntime tokenizers \
+            sentence-transformers torch transformers safetensors \
+            2>/dev/null
         print -P "${C[green]}✓${C[reset]} Uninstalled"
         return 0
     fi
