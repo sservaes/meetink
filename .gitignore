@@ -1,7 +1,7 @@
 # Swift build artifacts
 .build/
 .swiftpm/
-src/capture/local-speech-capture
+src/capture/meetink-capture
 src/capture/.build/
 *.xcodeproj/
 DerivedData/
@@ -17,9 +17,23 @@ DerivedData/
 
 # Local config / data (never commit)
 .local-speech/
+.meetink/
 *.wav
 *.bin
 *.npy
+*.gguf
+*.onnx
+*.mlmodelc/
+*.safetensors
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Project-local secrets / runtime
+/tmp/meetink-*
 
 # Logs
 *.log
