@@ -209,8 +209,14 @@ def _append_chunks(idx_dir: Path, new_embeds: np.ndarray,
         combined = np.vstack([existing, new_embeds])
     else:
         combined = new_embeds
+    # Important: pass an open file handle to np.save, not a string path.
+    # When given a string that doesn't end in `.npy`, numpy silently
+    # appends `.npy` — so np.save("chunks.npy.tmp", arr) actually
+    # writes to "chunks.npy.tmp.npy" and the subsequent .replace()
+    # fails with FileNotFoundError. The handle form bypasses that.
     tmp = npy_path.with_suffix(".npy.tmp")
-    np.save(str(tmp), combined)
+    with tmp.open("wb") as f:
+        np.save(f, combined)
     tmp.replace(npy_path)
 
     jl_path = idx_dir / "chunks.jsonl"
