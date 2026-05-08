@@ -209,6 +209,45 @@ def _agent_notify(title: str, body: str, actions: list[str],
 
 
 # ---------------------------------------------------------------------------
+# Auto-sensitivity: map attendee count to a diarize-server preset.
+#
+# Scheduled events know their attendees from EventKit, so we can pick the
+# right tuning before /start fires:
+#   1-2 → focused  (1:1s — wide MARGIN to avoid bob/flavio confusion;
+#                   low CLUSTER_THRESHOLD so one voice = one cluster)
+#   3-5 → default  (small team meetings — balanced)
+#   6+  → strict   (large meetings — preserve distinct voices, avoid
+#                   misnaming a stranger as someone enrolled)
+#
+# Best-effort: a 2 s POST to the diarize-server. Failure (server off, user
+# disabled diarize) silently no-ops — sensitivity tuning never blocks a
+# recording. Instant meetings skip this entirely (no attendee signal).
+# ---------------------------------------------------------------------------
+
+def _pick_preset_from_attendees(attendees: list) -> str:
+    n = max(1, len(attendees))
+    if n <= 2:
+        return "focused"
+    if n <= 5:
+        return "default"
+    return "strict"
+
+
+def _apply_sensitivity_preset(mode: str) -> bool:
+    try:
+        import urllib.request
+        port = int(os.environ.get("MEETINK_DIARIZE_PORT", "8179"))
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/session/sensitivity?mode={mode}",
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=2).read()
+        return True
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Launcher dispatch (re-uses cmd_start / cmd_stop / cmd_project)
 # ---------------------------------------------------------------------------
 
@@ -561,6 +600,18 @@ class WatchManager:
         # 1-2 s on a cold whisper-server.
         if chosen.project:
             _project_use(chosen.project)
+
+        # Auto-tune diarize sensitivity from the attendee count before
+        # /start fires (so the very first /identify call hits the right
+        # preset). No-ops cleanly if diarize-server is off.
+        preset = _pick_preset_from_attendees(chosen.attendees)
+        if _apply_sensitivity_preset(preset):
+            print(
+                f"[watch] sensitivity → {preset} "
+                f"({len(chosen.attendees)} attendees, "
+                f"{chosen.title!r})",
+                file=sys.stderr,
+            )
 
         env_extras = self._metadata_env(chosen)
         ok = _start_recording_subprocess(env_extras)
