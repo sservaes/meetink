@@ -1,6 +1,6 @@
 # Granting macOS permissions
 
-`local-speech` needs two macOS privacy permissions to work. Both attach to the **terminal app** you launched the tool from (Terminal.app, iTerm2, Ghostty, Warp, etc.) — not to `local-speech` itself.
+`meetink` needs two macOS privacy permissions to work. Both attach to the **terminal app** you launched the tool from (Terminal.app, iTerm2, Ghostty, Warp, etc.) — not to `meetink` itself.
 
 ## 1. Screen & System Audio Recording
 
@@ -22,11 +22,11 @@ Required for capturing your own voice.
 Run:
 
 ```sh
-local-speech start
+meetink start
 ```
 
 If permissions are missing, the Swift binary prints a clear error pointing you to the right setting. If you see no error and recording starts, you're good.
 
 ## Removing permissions
 
-You can revoke at any time in the same panels. `local-speech` will fail loudly the next time you `start`.
+You can revoke at any time in the same panels. `meetink` will fail loudly the next time you `start`.

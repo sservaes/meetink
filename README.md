@@ -1,4 +1,4 @@
-# local-speech
+# meetink
 
 Local-first meeting transcription for the macOS terminal. Captures system audio (Zoom, Meet, Teams) and microphone simultaneously, runs them through whisper.cpp on your machine, and writes a labelled transcript file. No cloud, no API keys.
 
@@ -16,9 +16,9 @@ If you take a lot of meetings on your Mac and want a private transcript, this gi
 ## Install
 
 ```sh
-git clone https://github.com/sservaes/local-speech.git
-cd local-speech
-./bin/local-speech setup
+git clone https://github.com/sservaes/meetink.git
+cd meetink
+./bin/meetink setup
 ```
 
 `setup` installs whisper.cpp via Homebrew, downloads the `small.en` model (~500 MB), and builds the Swift capture binary.
@@ -26,22 +26,22 @@ cd local-speech
 Optionally, symlink the launcher onto your `PATH`:
 
 ```sh
-ln -s "$(pwd)/bin/local-speech" /usr/local/bin/local-speech
+ln -s "$(pwd)/bin/meetink" /usr/local/bin/meetink
 ```
 
 ## Usage
 
 ```sh
-local-speech start    # begin recording + transcribing
-local-speech stop     # stop and save
-local-speech status   # is it running?
-local-speech tail     # follow the transcript live
-local-speech help     # full help
+meetink start    # begin recording + transcribing
+meetink stop     # stop and save
+meetink status   # is it running?
+meetink tail     # follow the transcript live
+meetink help     # full help
 ```
 
-Run `local-speech` with no arguments to see the welcome screen with current state.
+Run `meetink` with no arguments to see the welcome screen with current state.
 
-The transcript writes to `~/.local-speech/transcripts/live.txt` with timestamped lines:
+The transcript writes to `~/.meetink/transcripts/live.txt` with timestamped lines:
 
 ```
 [14:32:08] ME: yeah I think we should ship it next week
@@ -55,14 +55,14 @@ On first run macOS will ask for two things:
 1. **Screen & System Audio Recording** — required to capture system audio (i.e. the other people in your meeting). Grant via *System Settings → Privacy & Security → Screen & System Audio Recording*.
 2. **Microphone** — required to capture your voice.
 
-Both prompts target whichever terminal app you launched `local-speech` from.
+Both prompts target whichever terminal app you launched `meetink` from.
 
 ## Custom vocabulary
 
 Whisper does better when you tell it what jargon and proper nouns to expect. Edit:
 
 ```sh
-~/.local-speech/prompts/default.txt
+~/.meetink/prompts/default.txt
 ```
 
 Add comma-separated names, acronyms, and domain-specific words. Example template at `src/capture/prompts/example.txt`.
@@ -77,7 +77,7 @@ Add comma-separated names, acronyms, and domain-specific words. Example template
 └─────────────────┘     └──────────────────┘     └──────────────────┘
                                                           │
                                                           ▼
-                                          ~/.local-speech/transcripts/live.txt
+                                          ~/.meetink/transcripts/live.txt
 ```
 
 - **Capture:** `src/capture/Sources/main.swift` — Swift binary, ScreenCaptureKit for system audio, AVAudioEngine for mic. Mixed to 16 kHz mono and chunked every 3 seconds.
@@ -87,7 +87,7 @@ Add comma-separated names, acronyms, and domain-specific words. Example template
 ## Limitations
 
 - macOS only (uses ScreenCaptureKit and AVAudioEngine)
-- English-only by default (the `small.en` model). For other languages, override `LOCAL_SPEECH_MODEL` to point at a multilingual `ggml-*.bin` file.
+- English-only by default (the `small.en` model). For other languages, override `MEETINK_MODEL` to point at a multilingual `ggml-*.bin` file.
 - Single-microphone source. If you want speaker diarization (assigning names to voices), that's planned but not in v0.1.
 
 ## Configuration
@@ -96,11 +96,11 @@ All paths can be overridden via environment variables:
 
 | Variable | Default |
 |---|---|
-| `LOCAL_SPEECH_HOME` | `~/.local-speech` |
-| `LOCAL_SPEECH_MODEL` | `$LOCAL_SPEECH_HOME/models/ggml-small.en.bin` |
-| `LOCAL_SPEECH_TRANSCRIPT` | `$LOCAL_SPEECH_HOME/transcripts/live.txt` |
-| `LOCAL_SPEECH_PROMPT` | `$LOCAL_SPEECH_HOME/prompts/default.txt` |
-| `LOCAL_SPEECH_CHUNK_DIR` | `/tmp/local-speech-chunks` |
+| `MEETINK_HOME` | `~/.meetink` |
+| `MEETINK_MODEL` | `$MEETINK_HOME/models/ggml-small.en.bin` |
+| `MEETINK_TRANSCRIPT` | `$MEETINK_HOME/transcripts/live.txt` |
+| `MEETINK_PROMPT` | `$MEETINK_HOME/prompts/default.txt` |
+| `MEETINK_CHUNK_DIR` | `/tmp/meetink-chunks` |
 
 ## License
 
