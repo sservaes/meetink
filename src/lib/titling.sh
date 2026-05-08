@@ -521,6 +521,47 @@ generate_title() {
     slugify "$title"
 }
 
+# Move whichever of (old, new) idx dirs has more content into the target
+# path, delete the loser. Both args may or may not exist; called only when
+# at least one does. Sized via `du -sk` (1-block resolution is plenty —
+# stub indexes are <8 KB, populated ones are MB+).
+_resolve_idx_collision() {
+    local old="$1" new="$2"
+    if [[ "$old" == "$new" ]]; then
+        return 0   # no-op when the basenames already coincide
+    fi
+
+    local old_size=0 new_size=0
+    [[ -d "$old" ]] && old_size=$(du -sk "$old" 2>/dev/null | awk '{print $1+0}')
+    [[ -d "$new" ]] && new_size=$(du -sk "$new" 2>/dev/null | awk '{print $1+0}')
+
+    if (( old_size == 0 && new_size == 0 )); then
+        return 0   # neither has content — nothing to migrate
+    fi
+
+    # Single-occupant cases: trivial mv (when old has content and new
+    # doesn't) or no-op (when new already has the content).
+    if (( old_size > 0 && new_size == 0 )); then
+        mv "$old" "$new" 2>/dev/null
+        return 0
+    fi
+    if (( old_size == 0 && new_size > 0 )); then
+        # `new` is already populated; `old` is just a stub or missing.
+        [[ -d "$old" ]] && rm -rf "$old"
+        return 0
+    fi
+
+    # Both populated: keep the one with more content. The smaller is
+    # almost always a stub (segments/ + meta.json from a re-init that
+    # never wrote chunks), so this picks the right winner in practice.
+    if (( new_size >= old_size )); then
+        rm -rf "$old"
+    else
+        rm -rf "$new"
+        mv "$old" "$new" 2>/dev/null
+    fi
+}
+
 # Rename a session file with an AI slug. Best-effort — leaves the file alone
 # if anything fails. Updates the live.txt symlink if it pointed at the old name.
 # Args: $1 = absolute path to the session file (e.g. /…/2026-05-07_14-32-08.txt)
@@ -541,10 +582,21 @@ title_session_file() {
     local dir="${file:h}"
     local base="${file:t:r}"
     local trimmed="${base%-*}"
-    local new="$dir/${trimmed}_${slug}.txt"
+    local canonical="$dir/${trimmed}_${slug}.txt"
+    local new="$canonical"
 
+    # Collision: a previous session in the same minute auto-titled to
+    # the same slug. Walk _2 / _3 / … until we find a free slot. We
+    # used to silently bail on collision, which left the just-finished
+    # transcript named only by timestamp and orphaned its .idx — see
+    # the bug fixed in this commit.
+    local n=2
+    while [[ -e "$new" ]] && (( n <= 99 )); do
+        new="$dir/${trimmed}_${slug}_${n}.txt"
+        (( n++ ))
+    done
     if [[ -e "$new" ]]; then
-        print -P "${C[dim]}  (skipping rename — ${new:t} already exists)${C[reset]}"
+        print -P "${C[dim]}  (rename skipped — 99 same-slug collisions)${C[reset]}"
         return 0
     fi
 
@@ -554,14 +606,17 @@ title_session_file() {
     fi
 
     # Move the .idx sidecar in lockstep so the index stays paired with
-    # the renamed transcript. The .idx dir matches the .txt basename
-    # exactly (e.g. 2026-05-07_14-32-08.idx), so the rename mirrors the
-    # transcript's. Skipped if the sidecar doesn't exist (recording
-    # without /index install, or older meetink that pre-dates indexing).
+    # the renamed transcript. Two failure modes the previous code hit:
+    #   1. Target dir already exists → silent bail, leaving the old
+    #      timestamp-named .idx orphaned next to the renamed .txt.
+    #   2. The indexer somehow co-wrote into a sibling .idx during the
+    #      session, leaving us with one populated dir and one stub.
+    # New policy: pick the most-populated dir between the timestamp
+    # and target paths, move it to the target, delete the loser.
     local old_idx="${file:r}.idx"
     local new_idx="${new:r}.idx"
-    if [[ -d "$old_idx" && ! -e "$new_idx" ]]; then
-        mv "$old_idx" "$new_idx" 2>/dev/null
+    if [[ -d "$old_idx" || -d "$new_idx" ]]; then
+        _resolve_idx_collision "$old_idx" "$new_idx"
     fi
 
     # Update live.txt symlink target if it pointed at the old file
