@@ -68,16 +68,9 @@ cmd_ask() {
     fi
 
     local tx_path=$(_ask_transcript_path)
-    if [[ -z "$tx_path" ]]; then
-        print -P "${C[red]}error:${C[reset]} no transcript to ask about"
-        print -P "  ${C[dim]}Run /start first, or switch to a project that has past transcripts.${C[reset]}"
-        return 1
-    fi
-
     local me=$(me_name_get 2>/dev/null)
     local project=$(project_active_get 2>/dev/null)
     local context_text=$(_ask_context_files)
-    local transcript_text=$(<"$tx_path")
 
     # Past-meetings digest from this project's rolling meetings.md. Claude
     # has 200K context so we send the full file rather than tier-slicing —
@@ -89,14 +82,34 @@ cmd_ask() {
         meetings_text=$(<"$meetings_md")
     fi
 
+    # /ask is also useful when there's no transcript yet, as long as the
+    # project has *some* grounding (context docs or a past-meetings digest).
+    # Refuse only when we have absolutely nothing.
+    if [[ -z "$tx_path" && -z "$context_text" && -z "$meetings_text" ]]; then
+        print -P "${C[red]}error:${C[reset]} nothing to ask about"
+        print -P "  ${C[dim]}Attach context with${C[reset]} ${C[bright_cyan]}/context add <file>${C[reset]}${C[dim]}, or${C[reset]} ${C[bright_cyan]}/start${C[reset]} ${C[dim]}a recording first.${C[reset]}"
+        return 1
+    fi
+
+    local transcript_text=""
+    [[ -n "$tx_path" ]] && transcript_text=$(<"$tx_path")
+
     # Build the prompt incrementally so we only include sections we have.
-    local prompt="You are an assistant helping a user reason about a meeting transcript. Answer their question concisely and directly. If the transcript doesn't contain enough information to answer, say so plainly rather than speculating. When past meetings from the same project are provided, you may reference them — they appear newest first."
+    # Two system prompts depending on whether a transcript is in play —
+    # otherwise the model is told to ground in a transcript that doesn't
+    # exist and gets confused.
+    local prompt
+    if [[ -n "$tx_path" ]]; then
+        prompt="You are an assistant helping a user reason about a meeting transcript. Answer their question concisely and directly. If the transcript doesn't contain enough information to answer, say so plainly rather than speculating. When past meetings from the same project are provided, you may reference them — they appear newest first."
+    else
+        prompt="You are an assistant helping a user reason about an ongoing project. Answer their question concisely and directly using the provided background documents and past meeting summaries. If the context doesn't contain enough information to answer, say so plainly rather than speculating. Past meetings appear newest first."
+    fi
     [[ -n "$me" ]] && prompt+="
 
-The user's name is ${me} (their lines appear as ${(U)me}: in the transcript)."
+The user's name is ${me} (their lines appear as ${(U)me}: in transcripts)."
     [[ -n "$project" ]] && prompt+="
 
-This meeting is part of project: ${project}."
+Active project: ${project}."
     if [[ -n "$context_text" ]]; then
         prompt+="
 
@@ -109,10 +122,13 @@ ${context_text}"
 Past meetings in this project (newest first):
 ${meetings_text}"
     fi
-    prompt+="
+    if [[ -n "$tx_path" ]]; then
+        prompt+="
 
 Current meeting transcript (file: ${tx_path:t}):
-${transcript_text}
+${transcript_text}"
+    fi
+    prompt+="
 
 Question from the user: ${question}"
 

@@ -973,7 +973,7 @@ def _meetings_md_for_project() -> str:
 
 def _build_ask_prompt(
     question: str,
-    transcript_path: Path,
+    transcript_path: Path | None,
     prefer_summaries: bool = False,
     include_past_meetings: bool = True,
     include_ask_history: bool = True,
@@ -987,10 +987,12 @@ def _build_ask_prompt(
       - project name
       - background docs (manual, from <project>/_context/)
       - past meetings digest (auto, recency-tiered slice of meetings.md)
-      - current transcript
+      - current transcript (omitted when transcript_path is None)
       - question
     Sections that don't apply are omitted entirely.
 
+    `transcript_path=None` is allowed — /ask is also useful for project-only
+    questions when only context docs or past meetings exist.
     `prefer_summaries=True` uses per-doc .summary.md files instead of the
     full converted markdown — needed for local backend's tighter budget.
     `include_past_meetings=False` suppresses the meetings.md section
@@ -1006,31 +1008,48 @@ def _build_ask_prompt(
             ask_history = get_runtime().ask_history_text()
         except ImportError:
             ask_history = ""
-    try:
-        transcript_text = transcript_path.read_text()
-    except OSError:
-        transcript_text = ""
 
-    system = (
-        "You are an assistant helping a user reason about a meeting transcript. "
-        "Answer their question concisely and directly. If the transcript "
-        "doesn't contain enough information to answer, say so plainly rather "
-        "than speculating. When past meetings from the same project are "
-        "provided, you may reference them — they appear newest first, with "
-        "older entries condensed; the most recent are most relevant. When "
-        "earlier turns in the current conversation are provided, treat them "
-        "as the active thread — the user may be asking a follow-up that "
-        "depends on what you said before."
-    )
+    transcript_text = ""
+    if transcript_path is not None:
+        try:
+            transcript_text = transcript_path.read_text()
+        except OSError:
+            transcript_text = ""
+
+    if transcript_path is not None:
+        system = (
+            "You are an assistant helping a user reason about a meeting "
+            "transcript. Answer their question concisely and directly. If "
+            "the transcript doesn't contain enough information to answer, "
+            "say so plainly rather than speculating. When past meetings from "
+            "the same project are provided, you may reference them — they "
+            "appear newest first, with older entries condensed; the most "
+            "recent are most relevant. When earlier turns in the current "
+            "conversation are provided, treat them as the active thread — "
+            "the user may be asking a follow-up that depends on what you "
+            "said before."
+        )
+    else:
+        system = (
+            "You are an assistant helping a user reason about an ongoing "
+            "project. Answer their question concisely and directly using "
+            "the provided background documents and past meeting summaries. "
+            "If the context doesn't contain enough information to answer, "
+            "say so plainly rather than speculating. Past meetings appear "
+            "newest first; older entries are condensed. When earlier turns "
+            "in the current conversation are provided, treat them as the "
+            "active thread — the user may be asking a follow-up that "
+            "depends on what you said before."
+        )
 
     parts = []
     if me:
         parts.append(
             f"The user's name is {me} (their lines appear as {me.upper()}: "
-            "in the transcript)."
+            "in transcripts)."
         )
     if project:
-        parts.append(f"This meeting is part of project: {project}.")
+        parts.append(f"Active project: {project}.")
     if context:
         parts.append(
             "Background documents (the user has curated these as relevant "
@@ -1041,7 +1060,11 @@ def _build_ask_prompt(
             "Past meetings in this project (newest first; older entries are "
             f"condensed or heading-only by recency):\n\n{past_meetings}"
         )
-    parts.append(f"Current meeting transcript (file: {transcript_path.name}):\n{transcript_text}")
+    if transcript_path is not None:
+        parts.append(
+            f"Current meeting transcript (file: {transcript_path.name}):\n"
+            f"{transcript_text}"
+        )
     if ask_history:
         parts.append(
             "Earlier in this conversation (most recent last; the user may be "
@@ -1055,6 +1078,7 @@ def _build_ask_prompt(
         "used_summaries": prefer_summaries,
         "had_past_meetings": bool(past_meetings),
         "had_ask_history": bool(ask_history),
+        "had_transcript": transcript_path is not None,
     }
     return system, user, stats
 
@@ -1091,10 +1115,16 @@ def _try_handle_ask_local(question: str) -> bool:
         return False  # mlx_runtime module missing somehow
 
     transcript_path = _ask_transcript_path()
+    # /ask is useful even without a transcript — context docs and past-meeting
+    # digests are valid grounding too. Only refuse when we have absolutely
+    # nothing to anchor the answer in.
     if transcript_path is None:
-        emit("\033[31merror:\033[0m no transcript to ask about")
-        emit("  \033[2mRun /start first, or switch to a project that has past transcripts.\033[0m")
-        return True
+        has_context = bool(_context_doc_pairs())
+        has_past = bool(_meetings_md_for_project())
+        if not has_context and not has_past:
+            emit("\033[31merror:\033[0m nothing to ask about")
+            emit("  \033[2mAttach context with /context add <file>, or /start a recording first.\033[0m")
+            return True
 
     if _ask_running.is_set():
         # Previous /ask still streaming — refuse rather than silently queue
