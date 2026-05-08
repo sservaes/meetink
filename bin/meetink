@@ -498,6 +498,19 @@ stop_whisper_server() {
 
 # --- Start command ---
 cmd_start() {
+    # Optional trailing args = whitelist of enrolled profiles for *this*
+    # session (e.g. `/start alex stacey florin`). Tolerates a leading
+    # "with" or "whitelist" keyword as a readability nicety. Skipped
+    # when no args are passed — manual /diarize whitelist remains in
+    # effect, /watch can set it per-meeting from calendar attendees.
+    local -a whitelist
+    if (( $# > 0 )); then
+        if [[ "$1" == "with" || "$1" == "whitelist" ]]; then
+            shift
+        fi
+        whitelist=("$@")
+    fi
+
     if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
         print -P "${C[yellow]}Already recording${C[reset]} (PID $(cat "$PID_FILE"))"
         print -P "  Transcript: ${C[dim]}$MK_TRANSCRIPT${C[reset]}"
@@ -535,6 +548,18 @@ cmd_start() {
     # session is truly a new voice, not yesterday's leftover. Best-effort —
     # silently skipped if the server isn't up.
     curl -s -o /dev/null -X POST "http://127.0.0.1:$MK_DIARIZE_PORT/session/clear" 2>/dev/null || true
+
+    # Apply per-session profile whitelist if /start got attendee names.
+    # Restricts /identify to those profiles only — voices that resemble
+    # any other profile fall through to clustering (THEM-X). Best-effort.
+    if (( ${#whitelist[@]} > 0 )); then
+        local joined="${(j:,:)whitelist}"
+        local resp=$(curl -s -X POST "http://127.0.0.1:$MK_DIARIZE_PORT/session/whitelist?profiles=$joined" 2>/dev/null)
+        local applied=$(print -- "$resp" | sed -nE 's/.*"whitelist":[[:space:]]*\[([^]]*)\].*/\1/p' | sed 's/"//g; s/, */, /g')
+        local unknown=$(print -- "$resp" | sed -nE 's/.*"unknown":[[:space:]]*\[([^]]*)\].*/\1/p' | sed 's/"//g; s/, */, /g')
+        [[ -n "$applied" ]] && print -P "  ${C[dim]}Whitelist:${C[reset]} ${C[bright_cyan]}${applied}${C[reset]}"
+        [[ -n "$unknown" ]] && print -P "  ${C[yellow]}⚠${C[reset]}  ${C[dim]}unknown (ignored):${C[reset]} ${unknown} ${C[dim]}— enrol via /profile add${C[reset]}"
+    fi
 
     MEETINK_MODEL="$MK_MODEL" \
     MEETINK_TRANSCRIPT="$session_file" \

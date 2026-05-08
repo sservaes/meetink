@@ -1563,6 +1563,48 @@ def _try_handle_ask_local(question: str) -> bool:
 # outlives a single subcommand.
 # ---------------------------------------------------------------------------
 
+_WATCH_CONFIG_KEY = "watch_enabled"
+_CONFIG_FILE = MK_HOME / "config"
+
+
+def _watch_enabled_get() -> bool:
+    """Read watch_enabled flag from ~/.meetink/config. Default false."""
+    if not _CONFIG_FILE.is_file():
+        return False
+    try:
+        for line in _CONFIG_FILE.read_text().splitlines():
+            if line.startswith(f"{_WATCH_CONFIG_KEY}="):
+                v = line.split("=", 1)[1].strip().lower()
+                return v in ("true", "1", "yes", "on")
+    except OSError:
+        pass
+    return False
+
+
+def _watch_enabled_set(val: bool) -> None:
+    """Persist watch_enabled. Mirrors /diarize's pattern in diarize.sh."""
+    _CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    flag = "true" if val else "false"
+    lines: list[str] = []
+    found = False
+    if _CONFIG_FILE.is_file():
+        try:
+            for line in _CONFIG_FILE.read_text().splitlines():
+                if line.startswith(f"{_WATCH_CONFIG_KEY}="):
+                    lines.append(f"{_WATCH_CONFIG_KEY}={flag}")
+                    found = True
+                else:
+                    lines.append(line)
+        except OSError:
+            pass
+    if not found:
+        lines.append(f"{_WATCH_CONFIG_KEY}={flag}")
+    try:
+        _CONFIG_FILE.write_text("\n".join(lines) + "\n")
+    except OSError:
+        pass
+
+
 def _handle_watch_inproc(args: list[str]) -> bool:
     """Returns True if handled (caller should NOT fall through to the
     launcher). Currently always returns True for on/off/status/skip;
@@ -1578,17 +1620,21 @@ def _handle_watch_inproc(args: list[str]) -> bool:
     if sub in ("on", "start"):
         if mgr.is_running():
             emit("\033[33m⚠\033[0m  /watch is already running")
+            _watch_enabled_set(True)  # idempotent — keep flag in sync
             return True
         if not mgr.start():
             emit("\033[31merror:\033[0m couldn't start /watch")
             return True
+        _watch_enabled_set(True)
         emit("\033[32m✓\033[0m  /watch is on — calendar polling every 60s")
         emit("  \033[2mAuto-record fires 1 min before each event "
              "(Skip via notification or /watch skip).\033[0m")
         emit("  \033[2m/watch off when you're done for the day.\033[0m")
+        emit("  \033[2m(persists across REPL restarts — auto-resumes on launch.)\033[0m")
         return True
 
     if sub in ("off", "stop"):
+        _watch_enabled_set(False)
         if not mgr.is_running():
             emit("\033[2m/watch is not running.\033[0m")
             return True
@@ -1869,6 +1915,21 @@ def main() -> int:
             f"\033[2m(PID {pid}, {n} lines)\033[0m"
         )
         emit(f"  \033[2mTranscript:\033[0m \033[36m{MK_TRANSCRIPT}\033[0m")
+
+    # Auto-resume /watch if it was on when the user last quit.
+    # Persisted in ~/.meetink/config (watch_enabled=true). Errors stay
+    # silent — a missing watch module shouldn't block the REPL launch.
+    if _watch_enabled_get():
+        try:
+            from watch import WatchManager  # type: ignore[import-not-found]
+            mgr = WatchManager.get()
+            if not mgr.is_running() and mgr.start():
+                emit(
+                    "\033[32m●\033[0m \033[1m/watch resumed\033[0m "
+                    "\033[2m(calendar polling every 60s — /watch off to stop)\033[0m"
+                )
+        except Exception as e:
+            emit(f"\033[2m(/watch auto-resume failed: {e})\033[0m")
 
     emit("")
     emit("\033[2mType /help for commands. Tab to autocomplete.\033[0m")
