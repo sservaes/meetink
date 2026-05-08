@@ -64,6 +64,15 @@ POST   /session/auto-train?enabled=true|false&floor=0.88
                                       tweak any subset; high-confidence
                                       /identify matches fold back into the
                                       profile when guardrails all pass
+GET    /session/whitelist             current per-session profile whitelist
+POST   /session/whitelist?profiles=alex,stacey
+                                      restrict /identify to a subset of
+                                      profiles (others won't match → cluster
+                                      as THEM-X). Eliminates the "Mike's
+                                      voice scores 0.89 against ALEX" risk
+                                      when going into a meeting with people
+                                      who aren't all enrolled.
+POST   /session/whitelist?clear=true  drop the whitelist (match all profiles)
 """
 
 from __future__ import annotations
@@ -173,6 +182,19 @@ auto_train_settings: dict = {
         os.environ.get("MEETINK_AUTO_TRAIN_MIN_SAMPLES", "5"),
     ),
 }
+
+
+# --- Session whitelist ----------------------------------------------------
+#
+# When set, /identify only considers this subset of profiles. Voices that
+# would otherwise have matched a profile outside the whitelist fall through
+# to clustering (THEM-X) — which is exactly what you want when you go into
+# a meeting with people who aren't all enrolled. Auto-train naturally
+# inherits the restriction (it operates on identify's output).
+#
+# None = no whitelist, match against everything (default, backwards-compat).
+# []   = match against nothing, always cluster.
+session_whitelist: "list[str] | None" = None
 
 
 def _maybe_auto_train(
@@ -332,8 +354,19 @@ def identify(emb: np.ndarray) -> dict:
     if not profiles:
         return {"speaker": None, "confidence": 0.0, "runner_up": None, "runner_up_confidence": 0.0}
 
+    # Apply session whitelist if set. Profiles outside it are simply
+    # invisible to this match — voices that resemble them fall through
+    # to clustering (THEM-X) just like any other unknown speaker.
+    candidates = profiles
+    if session_whitelist is not None:
+        candidates = {
+            n: p for n, p in profiles.items() if n in session_whitelist
+        }
+        if not candidates:
+            return {"speaker": None, "confidence": 0.0, "runner_up": None, "runner_up_confidence": 0.0}
+
     sims = sorted(
-        ((name, cosine(emb, p["centroid"])) for name, p in profiles.items()),
+        ((name, cosine(emb, p["centroid"])) for name, p in candidates.items()),
         key=lambda kv: kv[1],
         reverse=True,
     )
@@ -446,6 +479,7 @@ class Handler(BaseHTTPRequestHandler):
                 "cluster_threshold": settings["cluster_threshold"],
                 "preset": settings_preset,
                 "clusters": len(clusters),
+                "whitelist": session_whitelist,
             })
             return
         if path == "/profiles":
@@ -467,6 +501,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/session/auto-train":
             self._json(200, dict(auto_train_settings))
+            return
+        if path == "/session/whitelist":
+            self._json(200, {
+                "whitelist": session_whitelist,
+                "profiles_known": list(profiles.keys()),
+            })
             return
         if path == "/session/clusters":
             self._json(200, {
@@ -588,6 +628,37 @@ class Handler(BaseHTTPRequestHandler):
                     "from": src_letter,
                     "into": dst_letter,
                     "samples": count,
+                })
+                return
+            if url.path == "/session/whitelist":
+                qs = parse_qs(url.query)
+                global session_whitelist
+                if qs.get("clear", [""])[0].lower() in ("1", "true", "yes"):
+                    session_whitelist = None
+                    print("session: whitelist cleared", file=sys.stderr)
+                    self._json(200, {"ok": True, "whitelist": None})
+                    return
+                raw = qs.get("profiles", [""])[0].strip()
+                if not raw:
+                    self._json(400, {
+                        "error": "need ?profiles=alex,stacey or ?clear=true",
+                    })
+                    return
+                requested = [n.strip() for n in raw.split(",") if n.strip()]
+                # Filter to profiles we actually know about. Unknown names
+                # are reported back so the caller can warn.
+                known = [n for n in requested if n in profiles]
+                unknown = [n for n in requested if n not in profiles]
+                session_whitelist = known
+                print(
+                    f"session: whitelist set to {known} "
+                    f"(unknown ignored: {unknown})",
+                    file=sys.stderr,
+                )
+                self._json(200, {
+                    "ok": True,
+                    "whitelist": known,
+                    "unknown": unknown,
                 })
                 return
             if url.path == "/session/auto-train":

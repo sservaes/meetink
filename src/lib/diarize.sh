@@ -282,6 +282,73 @@ diarize_sensitivity() {
     print -P "${C[green]}✓${C[reset]} Sensitivity → ${C[bold]}${mode}${C[reset]} ${C[dim]}(threshold=${thr}, margin=${mar}, cluster_threshold=${clt})${C[reset]}"
 }
 
+# /diarize whitelist — restrict /identify to a subset of enrolled profiles
+# for the current session. Eliminates the cross-meeting false-match risk
+# (Mike's voice scoring 0.89 against ALEX when Mike is the only person on
+# the call). /watch sets this automatically from calendar attendees; you
+# can also set it manually for ad-hoc calls.
+diarize_whitelist() {
+    if ! diarize_running; then
+        print -P "${C[red]}error:${C[reset]} diarize-server not running"
+        return 1
+    fi
+    local first="$1"
+    if [[ -z "$first" ]]; then
+        # Show current
+        local resp=$(curl -sf "http://127.0.0.1:$MK_DIARIZE_PORT/session/whitelist")
+        if [[ -z "$resp" ]]; then
+            print -P "${C[red]}error:${C[reset]} no response from diarize-server"
+            return 1
+        fi
+        # The whitelist field is either null or [..]; "null" means match-all.
+        local wl=$(print -- "$resp" | sed -nE 's/.*"whitelist":[[:space:]]*\[([^]]*)\].*/\1/p')
+        local null_chk=$(print -- "$resp" | sed -nE 's/.*"whitelist":[[:space:]]*(null).*/\1/p')
+        local known=$(print -- "$resp" | sed -nE 's/.*"profiles_known":[[:space:]]*\[([^]]*)\].*/\1/p')
+        print -P ""
+        print -P "${C[bright_yellow]}WHITELIST${C[reset]}"
+        if [[ "$null_chk" == "null" ]]; then
+            print -P "  ${C[dim]}status:${C[reset]}     ${C[gray]}○ no whitelist${C[reset]} ${C[dim]}— /identify matches all enrolled profiles${C[reset]}"
+        elif [[ -z "$wl" ]]; then
+            print -P "  ${C[dim]}status:${C[reset]}     ${C[red]}● empty${C[reset]} ${C[dim]}— /identify will always cluster (no profile matches)${C[reset]}"
+        else
+            local pretty=$(print -- "$wl" | sed 's/"//g; s/, */, /g')
+            print -P "  ${C[dim]}status:${C[reset]}     ${C[green]}● ${pretty}${C[reset]}"
+        fi
+        if [[ -n "$known" ]]; then
+            local pretty_known=$(print -- "$known" | sed 's/"//g; s/, */, /g')
+            print -P "  ${C[dim]}enrolled:${C[reset]}   ${pretty_known}"
+        fi
+        print -P ""
+        print -P "  ${C[dim]}/diarize whitelist alex stacey florin${C[reset]}   ${C[dim]}— restrict to these${C[reset]}"
+        print -P "  ${C[dim]}/diarize whitelist clear${C[reset]}                ${C[dim]}— remove the restriction${C[reset]}"
+        print -P ""
+        return 0
+    fi
+
+    if [[ "$first" == "clear" || "$first" == "off" || "$first" == "none" ]]; then
+        curl -s -X POST "http://127.0.0.1:$MK_DIARIZE_PORT/session/whitelist?clear=true" >/dev/null
+        print -P "${C[green]}✓${C[reset]} Whitelist cleared ${C[dim]}(matching against all profiles again)${C[reset]}"
+        return 0
+    fi
+
+    # Treat all positional args as profile names. Comma-encode for the
+    # query string, URL-safety-wise these are simple identifiers (no
+    # slashes/dots permitted by /profile add).
+    local names=("$@")
+    local joined="${(j:,:)names}"
+    local resp=$(curl -s -X POST "http://127.0.0.1:$MK_DIARIZE_PORT/session/whitelist?profiles=$joined")
+    if ! _resp_ok "$resp"; then
+        print -P "${C[red]}error:${C[reset]} $resp"
+        return 1
+    fi
+    local pretty=$(print -- "$resp" | sed -nE 's/.*"whitelist":[[:space:]]*\[([^]]*)\].*/\1/p' | sed 's/"//g; s/, */, /g')
+    local unknown=$(print -- "$resp" | sed -nE 's/.*"unknown":[[:space:]]*\[([^]]*)\].*/\1/p' | sed 's/"//g; s/, */, /g')
+    print -P "${C[green]}✓${C[reset]} Whitelist → ${C[bold]}${pretty}${C[reset]}"
+    if [[ -n "$unknown" ]]; then
+        print -P "  ${C[yellow]}⚠${C[reset]}  ${C[dim]}unknown (ignored):${C[reset]} ${unknown} ${C[dim]}— enrol via /profile add${C[reset]}"
+    fi
+}
+
 # /diarize auto-train — show or tweak the continuous self-improvement knob.
 # When on (default), high-confidence /identify matches fold back into the
 # profile so it sharpens with real conversational audio over time. The
@@ -404,6 +471,7 @@ cmd_diarize() {
         sensitivity|sens)  diarize_sensitivity "$2" ;;
         auto-train|autotrain|auto_train)
                            diarize_auto_train "$2" "$3" ;;
+        whitelist|wl)      shift; diarize_whitelist "$@" ;;
         *)
             print -P "${C[red]}unknown:${C[reset]} ${C[dim]}/diarize $sub${C[reset]}"
             print -P "  ${C[dim]}/diarize${C[reset]} | ${C[dim]}/diarize on${C[reset]} | ${C[dim]}/diarize off${C[reset]} | ${C[dim]}/diarize install${C[reset]} | ${C[dim]}/diarize rm${C[reset]} | ${C[dim]}/diarize sensitivity [mode]${C[reset]}"

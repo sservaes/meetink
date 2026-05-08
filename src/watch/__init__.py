@@ -247,6 +247,60 @@ def _apply_sensitivity_preset(mode: str) -> bool:
         return False
 
 
+def _list_diarize_profiles() -> list[str]:
+    """Names of every enrolled profile on the diarize-server. Empty list
+    if the server is off or returns nothing — caller treats that as
+    'no profiles to whitelist against' and skips."""
+    try:
+        import urllib.request
+        port = int(os.environ.get("MEETINK_DIARIZE_PORT", "8179"))
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/profiles", timeout=2,
+        ) as r:
+            data = json.loads(r.read())
+        return [p["name"] for p in data.get("profiles", [])]
+    except Exception:
+        return []
+
+
+def _match_attendees_to_profiles(attendees: list) -> list[str]:
+    """Pick the subset of enrolled profiles whose name appears as a
+    token in any attendee's name or email. Token = anything separated by
+    whitespace, dots, @, plus, hyphen, underscore. Word-boundary match
+    avoids false-positives like 'alex' matching 'alexandra'."""
+    import re
+    profile_names = _list_diarize_profiles()
+    if not profile_names or not attendees:
+        return []
+    haystack: set[str] = set()
+    for a in attendees:
+        for v in (a.get("name", ""), a.get("email", "")):
+            for tok in re.split(r"[\s.,@+\-_/]+", v.lower()):
+                if tok:
+                    haystack.add(tok)
+    return [p for p in profile_names if p.lower() in haystack]
+
+
+def _apply_whitelist(names: "list[str] | None") -> bool:
+    """POST the whitelist to the diarize-server. None or [] clears it."""
+    try:
+        import urllib.request
+        port = int(os.environ.get("MEETINK_DIARIZE_PORT", "8179"))
+        if not names:
+            url = f"http://127.0.0.1:{port}/session/whitelist?clear=true"
+        else:
+            url = (
+                f"http://127.0.0.1:{port}/session/whitelist"
+                f"?profiles={','.join(names)}"
+            )
+        urllib.request.urlopen(
+            urllib.request.Request(url, method="POST"), timeout=2,
+        ).read()
+        return True
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Launcher dispatch (re-uses cmd_start / cmd_stop / cmd_project)
 # ---------------------------------------------------------------------------
@@ -613,6 +667,26 @@ class WatchManager:
                 file=sys.stderr,
             )
 
+        # Restrict /identify to enrolled profiles whose names match the
+        # attendee list. Eliminates the failure mode where Mike's voice
+        # scores 0.89 against ALEX in a meeting Alex isn't even in.
+        # Falls through to "match all" when no enrolled attendees are
+        # found (better than silently mis-restricting on bad signal).
+        matched = _match_attendees_to_profiles(chosen.attendees)
+        if _apply_whitelist(matched if matched else None):
+            if matched:
+                print(
+                    f"[watch] whitelist → {matched} "
+                    f"(matched from {chosen.title!r})",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"[watch] whitelist cleared "
+                    f"(no enrolled attendees in {chosen.title!r})",
+                    file=sys.stderr,
+                )
+
         env_extras = self._metadata_env(chosen)
         ok = _start_recording_subprocess(env_extras)
         with self._lock:
@@ -778,6 +852,11 @@ class WatchManager:
                     ev.status = EventStatus.EXPIRED
                     self._instant_pending = False
                     return
+
+            # Clear any stale whitelist from a previous scheduled
+            # meeting — instant meetings have no attendee signal, so
+            # any subset would be wrong. Match-all is the safe default.
+            _apply_whitelist(None)
 
             env_extras = self._instant_metadata_env(ev)
             ok = _start_recording_subprocess(env_extras)

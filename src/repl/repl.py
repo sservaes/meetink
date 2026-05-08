@@ -892,6 +892,7 @@ _NESTED_COMMANDS = {
             ["status", "on", "off", "floor", "margin", "min"],
             ignore_case=True,
         ),
+        "whitelist": _profile_names_completer,
     },
     "/profile": {
         "add": None,
