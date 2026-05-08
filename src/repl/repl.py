@@ -446,21 +446,41 @@ def _active_local_llm_key() -> str:
     return "qwen3.5-2b"
 
 
+def _claude_budget() -> int:
+    """Approximate the active Claude model's context window. Sonnet/Opus/
+    Haiku 4.x ship at 200K; the `[1m]` extended-window variants take 1M.
+    Tokens, not characters."""
+    m = _claude_model().lower()
+    if "1m" in m:
+        return 1_000_000
+    return 200_000
+
+
+def _active_backend_budget() -> int:
+    """Token budget of whichever backend is currently active. For local
+    that's the per-quant /ask budget; for claude, the model's window."""
+    if _title_backend() == "claude":
+        return _claude_budget()
+    return _ask_budget_for(_active_local_llm_key())
+
+
 def _context_bar() -> str:
     """Render a 'context ▰▰▰▱▱▱▱▱ 38% 16K' chip showing how full the active
-    local model's token budget is for the next /ask. Hidden when backend is
-    claude (200K+ window — chip would always be a sliver). Uses a chars/4
-    estimate so the footer doesn't pay tokenizer cost on every tick."""
-    if _title_backend() != "local":
-        return ""
-
+    backend's token budget is for the next /ask. Always visible — even on
+    claude, the chip tells the user how much headroom remains in the 200K
+    (or 1M, for [1m] variants) window. Uses a chars/4 estimate so the
+    footer doesn't pay tokenizer cost on every tick."""
     now = time.time()
     if _ctx_bar_cache["text"] and now - _ctx_bar_cache["ts"] < 2.0:
         return _ctx_bar_cache["text"]
 
-    budget = _ask_budget_for(_active_local_llm_key())
-    # Match _try_handle_ask_local: 600 tokens reserved for response + safety.
-    effective = max(1, budget - 600)
+    budget = _active_backend_budget()
+    # Local path reserves ~600 tokens for response + safety (matches
+    # _try_handle_ask_local). Claude has plenty of headroom; reserve a
+    # nominal 2K so the bar approaches 100% honestly when the user is
+    # actually approaching the window's edge.
+    reserved = 2000 if _title_backend() == "claude" else 600
+    effective = max(1, budget - reserved)
 
     # Cheap chars/4 estimate. Transcript dominates everything else in
     # practice; ask_history is the next most variable contributor.
@@ -494,7 +514,12 @@ def _context_bar() -> str:
         else:
             bar += f"{_CTX_BAR_DIM}▱\033[0m"
 
-    budget_label = f"{budget // 1000}K" if budget >= 1000 else str(budget)
+    if budget >= 1_000_000:
+        budget_label = f"{budget // 1_000_000}M"
+    elif budget >= 1000:
+        budget_label = f"{budget // 1000}K"
+    else:
+        budget_label = str(budget)
     text = (
         f"\033[90mcontext\033[0m {bar} "
         f"{pct_colour}{pct}%\033[0m \033[90m{budget_label}\033[0m"

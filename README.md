@@ -183,7 +183,7 @@ Run `meetink` with no arguments at a TTY to drop into the REPL:
 - **Tab completion** — start typing `/` and hit Tab. Fuzzy completion on subcommands and (where it makes sense) on names: profile names, project names, attached context docs.
 - **Native scroll & selection** — wheel scroll, click-and-drag select, ⌘C, ⌘F all work because the REPL runs *inline* (not in alt-screen mode). The footer scrolls with content; scroll back to the prompt to see the live status.
 - **Streaming `/ask`** — answers stream token-by-token while the prompt stays usable. `/clear` clears the screen *and* drops the in-session `/ask` thread.
-- **Live context-bar** — the `context ▰▰▰▰▰▱▱▱ 62% 16K` chip on the bottom row shows how much of the active local model's token budget the next `/ask` will consume (transcript + Q&A history). Green → yellow → red as the meeting grows. Hidden when the `claude` backend is active (its 200K+ window makes the chip uninformative).
+- **Live context-bar** — the `context ▰▰▰▰▰▱▱▱ 62% 16K` chip on the bottom row shows how much of the active backend's token budget the next `/ask` will consume (transcript + Q&A history). Green → yellow → red as the meeting grows. Budget label adapts to whichever backend is active: `8K` / `16K` / `32K` for the local Qwen quants, `200K` for Sonnet/Opus/Haiku, `1M` for the `[1m]`-extended Claude variants.
 - **Slash command dispatch** — every slash command shells out to `bin/meetink <subcmd>` for stateful work; the REPL only owns the UI and the resident MLX model.
 
 ---
