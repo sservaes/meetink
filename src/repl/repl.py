@@ -483,20 +483,57 @@ def _context_bar() -> str:
     reserved = 2000 if _title_backend() == "claude" else 600
     effective = max(1, budget - reserved)
 
-    # Cheap chars/4 estimate. Transcript dominates everything else in
-    # practice; ask_history is the next most variable contributor.
+    # Cheap chars/4 estimate of what the next /ask prompt would weigh.
+    # Mirror the strategy ladder in _try_handle_ask_local: for backend=local
+    # we prefer the per-doc .summary.md when one exists (that's what /ask
+    # actually escalates to when the full doc would overflow); for claude
+    # we always count the full markdown.
     used = 0
+    backend_is_local = _title_backend() == "local"
+
     tx = _ask_transcript_path()
     if tx is not None:
         try:
             used += tx.stat().st_size // 4
         except OSError:
             pass
+
     try:
         from llm.mlx_runtime import get_runtime  # type: ignore[import-not-found]
         used += len(get_runtime().ask_history_text()) // 4
     except Exception:
         pass
+
+    proj_dir = _resolve_transcripts_dir()
+
+    # Project's rolling past-meetings digest. /ask trims this with the
+    # recency tier slicer for backend=local — we just count the file size,
+    # which slightly over-estimates compared to the slice. That's fine for
+    # a footer chip: erring on the side of "you're closer to full" is the
+    # right kind of conservatism.
+    meetings_md = proj_dir / "meetings.md"
+    if meetings_md.is_file():
+        try:
+            used += meetings_md.stat().st_size // 4
+        except OSError:
+            pass
+
+    # Per-project context docs. Prefer .summary.md on local so the bar
+    # tracks what /ask actually consumes after it falls back to summaries.
+    ctx_dir = proj_dir / "_context"
+    if ctx_dir.is_dir():
+        try:
+            for f in ctx_dir.glob("*.md"):
+                if f.name.endswith(".summary.md"):
+                    continue  # counted via its parent below if needed
+                summary = ctx_dir / f"{f.stem}.summary.md"
+                target = summary if backend_is_local and summary.is_file() else f
+                try:
+                    used += target.stat().st_size // 4
+                except OSError:
+                    pass
+        except OSError:
+            pass
 
     pct = min(100, int(round(100 * used / effective)))
     filled = max(0, min(_CTX_BAR_SEGMENTS, int(round(_CTX_BAR_SEGMENTS * pct / 100))))

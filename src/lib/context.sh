@@ -322,9 +322,13 @@ context_list() {
         claude_label=$(claude_model_active 2>/dev/null)
     fi
 
+    # Use plain `print --` (not `print -P`) for the budget rows: the chip
+    # output contains literal `%` characters (the percentage), which `print -P`
+    # would treat as the start of a prompt escape and consume the following
+    # `\033` byte — leaving "[0m" as visible literal text.
     print -P ""
-    print -P "  ${C[dim]}Total full:${C[reset]}     ${total_full} tokens · $(_budget_chip $total_full $claude_budget $claude_label) ${C[dim]}(claude path)${C[reset]}"
-    print -P "  ${C[dim]}Total compact:${C[reset]}  ${total_summary} tokens · $(_budget_chip $total_summary $local_budget $local_label) ${C[dim]}(local path)${C[reset]}"
+    print -r -- "  ${C[dim]}Total full:${C[reset]}     ${total_full} tokens · $(_budget_chip $total_full $claude_budget $claude_label) ${C[dim]}(claude path)${C[reset]}"
+    print -r -- "  ${C[dim]}Total compact:${C[reset]}  ${total_summary} tokens · $(_budget_chip $total_summary $local_budget $local_label) ${C[dim]}(local path)${C[reset]}"
     print -P ""
     print -P "  ${C[dim]}/context add <file>${C[reset]}     ${C[dim]}/context show <name>${C[reset]}     ${C[dim]}/context rm <name>${C[reset]}"
     print -P ""
