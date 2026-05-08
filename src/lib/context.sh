@@ -106,7 +106,18 @@ context_add() {
     # Derive name from filename if not given.
     [[ -z "$name" ]] && name=$(_context_slugify "$source")
 
-    _context_ensure_markitdown || return 1
+    # If the source is already markdown / plain text, the helper takes a
+    # passthrough path that doesn't need markitdown. Skip the ~80 MB install
+    # in that case — saves bandwidth and the "Installing markitdown" prompt.
+    local ext="${source:e:l}"
+    local is_plain=0
+    case "$ext" in
+        md|markdown|txt) is_plain=1 ;;
+    esac
+
+    if (( ! is_plain )); then
+        _context_ensure_markitdown || return 1
+    fi
 
     local dir=$(_context_dir)
     mkdir -p "$dir"
@@ -121,7 +132,11 @@ context_add() {
         }
     fi
 
-    print -P "${C[bright_yellow]}▸${C[reset]} Converting ${C[bold]}${source:t}${C[reset]} → markdown..."
+    if (( is_plain )); then
+        print -P "${C[bright_yellow]}▸${C[reset]} Importing ${C[bold]}${source:t}${C[reset]}..."
+    else
+        print -P "${C[bright_yellow]}▸${C[reset]} Converting ${C[bold]}${source:t}${C[reset]} → markdown..."
+    fi
     if ! "$MK_PY_VENV/bin/python" "$MK_ROOT/src/llm/context_helper.py" \
             convert "$source" --output "$target"; then
         print -P "${C[red]}error:${C[reset]} conversion failed"

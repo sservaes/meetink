@@ -71,28 +71,45 @@ def cmd_convert(args) -> int:
     src = Path(args.file).expanduser().resolve()
     if not src.is_file():
         _die(2, f"file not found: {src}")
-    try:
-        from markitdown import MarkItDown
-    except ImportError:
-        _die(1, "markitdown not installed. Run: /context add will install it on first use.")
 
-    md = MarkItDown(enable_plugins=False)
-    try:
-        result = md.convert(str(src))
-    except Exception as e:
-        _die(3, f"conversion failed: {e}")
+    # Plain text / markdown short-circuit: markitdown's output for these
+    # is essentially the file's contents (modulo whitespace), so we skip
+    # the dep + process altogether. Lets users attach .md/.txt without
+    # paying the ~80 MB markitdown install on first /context add.
+    ext = src.suffix.lower()
+    if ext in (".md", ".markdown", ".txt"):
+        try:
+            body = src.read_text(encoding="utf-8")
+        except OSError as e:
+            _die(3, f"read failed: {e}")
+        # Drop any existing leading frontmatter — we'll write our own.
+        body = _strip_frontmatter(body).strip()
+        if not body:
+            _die(4, "file is empty")
+        converter_version = "passthrough"
+    else:
+        try:
+            from markitdown import MarkItDown
+        except ImportError:
+            _die(1, "markitdown not installed. Run: /context add will install it on first use.")
 
-    body = (result.text_content or "").strip()
-    if not body:
-        _die(4, "conversion produced no text — file may be image-only PDF without OCR enabled")
+        md = MarkItDown(enable_plugins=False)
+        try:
+            result = md.convert(str(src))
+        except Exception as e:
+            _die(3, f"conversion failed: {e}")
 
-    converter_version = "markitdown"
-    try:
-        # markitdown exposes __version__ on the package on recent releases.
-        import markitdown as _m
-        converter_version = f"markitdown {getattr(_m, '__version__', '')}".strip()
-    except Exception:
-        pass
+        body = (result.text_content or "").strip()
+        if not body:
+            _die(4, "conversion produced no text — file may be image-only PDF without OCR enabled")
+
+        converter_version = "markitdown"
+        try:
+            # markitdown exposes __version__ on the package on recent releases.
+            import markitdown as _m
+            converter_version = f"markitdown {getattr(_m, '__version__', '')}".strip()
+        except Exception:
+            pass
 
     front = _frontmatter({
         "source": src.name,
