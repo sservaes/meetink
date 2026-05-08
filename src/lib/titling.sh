@@ -553,6 +553,17 @@ title_session_file() {
         return 0
     fi
 
+    # Move the .idx sidecar in lockstep so the index stays paired with
+    # the renamed transcript. The .idx dir matches the .txt basename
+    # exactly (e.g. 2026-05-07_14-32-08.idx), so the rename mirrors the
+    # transcript's. Skipped if the sidecar doesn't exist (recording
+    # without /index install, or older meetink that pre-dates indexing).
+    local old_idx="${file:r}.idx"
+    local new_idx="${new:r}.idx"
+    if [[ -d "$old_idx" && ! -e "$new_idx" ]]; then
+        mv "$old_idx" "$new_idx" 2>/dev/null
+    fi
+
     # Update live.txt symlink target if it pointed at the old file
     local live="$MK_TRANSCRIPTS_DIR/live.txt"
     if [[ -L "$live" ]]; then

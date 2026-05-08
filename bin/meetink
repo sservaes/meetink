@@ -44,6 +44,7 @@ source "$MK_ROOT/src/lib/identity.sh"
 source "$MK_ROOT/src/lib/ask.sh"
 source "$MK_ROOT/src/lib/summary.sh"
 source "$MK_ROOT/src/lib/context.sh"
+source "$MK_ROOT/src/lib/index.sh"
 source "$MK_ROOT/src/lib/repl.sh"
 
 # If an active project is configured, redirect $MK_TRANSCRIPTS_DIR /
@@ -672,6 +673,7 @@ case "${1:-}" in
     me)                shift; cmd_me "$@" ;;
     ask)               shift; cmd_ask "$@" ;;
     context)           shift; cmd_context "$@" ;;
+    index)             shift; cmd_index "$@" ;;
     prompt|vocab)
         mkdir -p "${MK_PROMPT:h}"
         [[ -f "$MK_PROMPT" ]] || touch "$MK_PROMPT"

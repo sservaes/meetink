@@ -492,11 +492,45 @@ def _context_bar() -> str:
     backend_is_local = _title_backend() == "local"
 
     tx = _ask_transcript_path()
+    has_idx = False
     if tx is not None:
         try:
-            used += tx.stat().st_size // 4
-        except OSError:
+            from index import IndexManager  # type: ignore[import-not-found]
+            has_idx = IndexManager.get().has_index_for(tx)
+        except ImportError:
             pass
+    if tx is not None:
+        if has_idx:
+            # Index path: /ask substitutes the raw transcript with the
+            # bounded RAG sections. Estimate matches retrieve_for_ask:
+            # rollups + per-segment summaries + recent tail + retrieved
+            # excerpts.
+            idx_dir = tx.with_suffix(".idx")
+            for name in ("decisions.md", "actions.md"):
+                p = idx_dir / name
+                if p.is_file():
+                    try:
+                        used += p.stat().st_size // 4
+                    except OSError:
+                        pass
+            seg_dir = idx_dir / "segments"
+            if seg_dir.is_dir():
+                try:
+                    for p in seg_dir.glob("*.md"):
+                        try:
+                            used += p.stat().st_size // 4
+                        except OSError:
+                            pass
+                except OSError:
+                    pass
+            # Constant-ish: last 20 lines verbatim (~400 tok) and ~24
+            # retrieved chunks after ±1 expansion (~480 tok).
+            used += 880
+        else:
+            try:
+                used += tx.stat().st_size // 4
+            except OSError:
+                pass
 
     try:
         from llm.mlx_runtime import get_runtime  # type: ignore[import-not-found]
@@ -599,6 +633,26 @@ def _footer_bottom_raw() -> str:
 _idle_sweep_ts: float = 0.0
 
 
+def _sync_indexer_to_recording() -> None:
+    """Match the IndexManager's lifecycle to the recording state. Called
+    after any command that might have changed it (/start, /stop). Cheap
+    when nothing changed: IndexManager.start/stop are idempotent."""
+    try:
+        from index import IndexManager  # type: ignore[import-not-found]
+    except ImportError:
+        return
+    mgr = IndexManager.get()
+    if not mgr.is_available():
+        return
+    if is_running():
+        tx = _ask_transcript_path()
+        if tx is not None:
+            mgr.start(tx)
+    else:
+        if mgr.is_running():
+            mgr.stop()
+
+
 def _maybe_idle_sweep() -> None:
     """Periodic idle-release poll. The bottom of handle_command already
     sweeps after non-/ask commands, but if the user just sits at the
@@ -631,7 +685,7 @@ def bottom_toolbar():
 SLASH_COMMANDS = [
     "/start", "/stop", "/status", "/tail", "/prompt", "/transcripts",
     "/model", "/llm", "/diarize", "/profile", "/project", "/me", "/ask",
-    "/context", "/setup", "/clear", "/help", "/quit",
+    "/context", "/index", "/setup", "/clear", "/help", "/quit",
 ]
 
 
@@ -815,6 +869,7 @@ HELP_TEXT = """\033[93mCOMMANDS\033[0m
   \033[1m/me\033[0m            \033[2mset your name: /me Stijn → mic stream labelled STIJN: in transcripts\033[0m
   \033[1m/ask\033[0m           \033[2mask the AI about the current/latest transcript: /ask what did we decide?\033[0m
   \033[1m/context\033[0m       \033[2mattach docs to a project: /context add report.pdf | list | rm | show\033[0m
+  \033[1m/index\033[0m         \033[2mRAG sidecar for /ask on long meetings: /index install | status | rm\033[0m
   \033[1m/setup\033[0m        \033[2minstall dependencies + download whisper model\033[0m
   \033[1m/clear\033[0m        \033[2mclear scrollback\033[0m
   \033[1m/help\033[0m         \033[2mthis list\033[0m
@@ -1072,12 +1127,29 @@ def _build_ask_prompt(
         except ImportError:
             ask_history = ""
 
+    # Try the RAG path: if a sidecar index exists for this transcript, we
+    # replace the bulky raw-transcript section with a structured assembly
+    # of decisions / actions / retrieved chunks / recent tail / segment
+    # summaries. Falls back to today's full-transcript path when there's
+    # no index (sentence-transformers not installed, or recording started
+    # before the index feature).
     transcript_text = ""
+    index_assembly = None
+    used_index = False
     if transcript_path is not None:
         try:
-            transcript_text = transcript_path.read_text()
-        except OSError:
-            transcript_text = ""
+            from index import IndexManager  # type: ignore[import-not-found]
+            mgr = IndexManager.get()
+            if mgr.has_index_for(transcript_path):
+                index_assembly = mgr.retrieve_for_ask(transcript_path, question)
+                used_index = True
+        except ImportError:
+            pass
+        if not used_index:
+            try:
+                transcript_text = transcript_path.read_text()
+            except OSError:
+                transcript_text = ""
 
     if transcript_path is not None:
         system = (
@@ -1123,7 +1195,43 @@ def _build_ask_prompt(
             "Past meetings in this project (newest first; older entries are "
             f"condensed or heading-only by recency):\n\n{past_meetings}"
         )
-    if transcript_path is not None:
+    if used_index and index_assembly is not None:
+        # Structured RAG section. Each subsection is dropped if empty so
+        # the model isn't fed empty headings. Order: rollups first (the
+        # cheap, dense facts), then the per-segment summaries (the
+        # global timeline view), then the retrieved excerpts (the dense
+        # match for the question), and finally the recent tail (verbatim
+        # so "what did we just say" answers stay grounded).
+        sections: list[str] = []
+        if index_assembly.decisions.strip():
+            sections.append(
+                f"### Decisions made so far\n{index_assembly.decisions.strip()}"
+            )
+        if index_assembly.actions.strip():
+            sections.append(
+                f"### Action items so far\n{index_assembly.actions.strip()}"
+            )
+        if index_assembly.segment_summaries.strip():
+            sections.append(
+                "### Per-segment summaries (chronological, ~5 min each)\n"
+                f"{index_assembly.segment_summaries.strip()}"
+            )
+        if index_assembly.retrieved_chunks.strip():
+            sections.append(
+                "### Most relevant transcript excerpts to the question\n"
+                f"{index_assembly.retrieved_chunks.strip()}"
+            )
+        if index_assembly.recent_tail.strip():
+            sections.append(
+                "### Most recent transcript lines (verbatim)\n"
+                f"{index_assembly.recent_tail.strip()}"
+            )
+        body = "\n\n".join(sections) if sections else "(no indexed content yet)"
+        parts.append(
+            f"Current meeting (file: {transcript_path.name}, "
+            f"{index_assembly.chunk_count} indexed lines):\n\n{body}"
+        )
+    elif transcript_path is not None:
         parts.append(
             f"Current meeting transcript (file: {transcript_path.name}):\n"
             f"{transcript_text}"
@@ -1142,6 +1250,8 @@ def _build_ask_prompt(
         "had_past_meetings": bool(past_meetings),
         "had_ask_history": bool(ask_history),
         "had_transcript": transcript_path is not None,
+        "used_index": used_index,
+        "indexed_chunks": index_assembly.chunk_count if index_assembly else 0,
     }
     return system, user, stats
 
@@ -1188,6 +1298,22 @@ def _try_handle_ask_local(question: str) -> bool:
             emit("\033[31merror:\033[0m nothing to ask about")
             emit("  \033[2mAttach context with /context add <file>, or /start a recording first.\033[0m")
             return True
+
+    # Lazy index build for past transcripts. If a transcript exists but
+    # has no .idx sidecar (recorded before /index install was run, or on
+    # an older meetink), build one now. The cost is one-time per
+    # transcript: ~5-30 s for a 1h meeting on local. Skipped when
+    # sentence-transformers isn't installed (graceful degradation to the
+    # full-transcript path).
+    if transcript_path is not None and not is_running():
+        try:
+            from index import IndexManager  # type: ignore[import-not-found]
+            mgr = IndexManager.get()
+            if mgr.is_available() and not mgr.has_index_for(transcript_path):
+                emit(f"\033[2mBuilding index for {transcript_path.name} (one-time, ~30s)...\033[0m")
+                mgr.ensure_index_for(transcript_path)
+        except ImportError:
+            pass
 
     if _ask_running.is_set():
         # Previous /ask still streaming — refuse rather than silently queue
@@ -1438,6 +1564,13 @@ def handle_command(line: str) -> bool:
         get_runtime().maybe_release_idle()
     except ImportError:
         pass
+
+    # Sync the indexer's lifecycle to the recording state. The launcher
+    # owns the actual recording (via a PID file); the REPL just observes
+    # via is_running(). Calling this after every command catches the
+    # /start → indexer-on and /stop → indexer-off transitions without
+    # needing a dedicated event hook.
+    _sync_indexer_to_recording()
 
     return True
 
