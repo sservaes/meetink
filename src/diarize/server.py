@@ -287,13 +287,25 @@ except ImportError:
     print("  Run /diarize install.", file=sys.stderr)
     sys.exit(1)
 
-print(f"loading model: {MODEL_PATH}", file=sys.stderr)
+# Default to CPU because sherpa-onnx's CoreML provider has been
+# unreliable for the WeSpeaker model on recent macOS — every
+# `compute()` returns "Unable to compute the prediction using a
+# neural network model" with no useful diagnostic. The model is
+# small (25 MB) and the inference is fast on CPU (~5-10 ms per 10 s
+# audio window), so the performance trade is negligible. Override
+# via MEETINK_DIARIZE_PROVIDER=coreml if you want to opt back in.
+DIARIZE_PROVIDER = os.environ.get("MEETINK_DIARIZE_PROVIDER", "cpu")
+
+print(
+    f"loading model: {MODEL_PATH} (provider={DIARIZE_PROVIDER})",
+    file=sys.stderr,
+)
 extractor = sherpa_onnx.SpeakerEmbeddingExtractor(
     sherpa_onnx.SpeakerEmbeddingExtractorConfig(
         model=str(MODEL_PATH),
         num_threads=2,
         debug=False,
-        provider="coreml",  # Apple Silicon; falls back to CPU automatically
+        provider=DIARIZE_PROVIDER,
     )
 )
 
