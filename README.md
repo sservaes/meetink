@@ -62,7 +62,7 @@ If you take a lot of meetings on your Mac and want a private transcript, you usu
 - **`/ask` over the meeting.** Stream answers about the current or most-recent transcript, with project context and prior `/ask` turns automatically threaded in.
 - **Auto-record from your calendar.** `/watch on` polls Calendar.app, fires a 1-minute notification before each event with a Skip button, then auto-starts recording at the scheduled time — and auto-stops when the conferencing app (Zoom / Meet / Teams / Webex) goes quiet for 2 min. Catches impromptu calls too: a meeting that starts without a calendar event triggers a confirmation notification ~30 s in. State persists across REPL restarts.
 - **Speaker identification, tunable per meeting.** Optional sidecar (sherpa-onnx + WeSpeaker) labels recurring voices by name once you've enrolled a `/profile`. Unknown voices get clustered live as `THEM-A`, `THEM-B`, … Three sensitivity presets (`focused` / `default` / `strict`) auto-applied from the calendar event's attendee count, plus a per-session **whitelist** that restricts matching to people who are actually in the room — so Mike's voice can never be misidentified as Alice in a 1:1 with Mike.
-- **Self-improving profiles.** High-confidence `/identify` matches fold back into the matched profile, sharpening its centroid from real conversational audio over time. Strict guardrails (confidence floor, margin multiplier, min-samples) prevent the classic pollution failure mode; one bad sample is recoverable with `/profile undo`.
+- **Self-improving profiles, that keep getting better.** Three mechanisms compound: (1) high-confidence `/identify` matches fold back into the matched profile (auto-train, off-by-default-able); (2) each profile holds up to 3 k-means centroids so a person's *different voice modes* (different mic, mood, accent variation) all match their best mode instead of being averaged together; (3) time decay (180-day half-life) keeps the centroid tracking the speaker's current voice, not their voice from a year ago. Outlier rejection guards every sample-add path (`/enroll`, `/train`, `/assign`, `/rename`, auto-train) so one bad sample can't pollute a centroid. Recoverable per-sample via `/profile undo`.
 - **Projects.** Group recordings, summaries, and reference docs by client / topic. `/ask` automatically pulls in past meetings and curated context for the active project.
 - **Context documents.** `/context add report.pdf` converts any PDF / DOCX / XLSX / PPTX / MD into the project's reference set so the LLM can read it.
 - **Native terminal UX.** `prompt_toolkit` REPL with tab completion, native scrollback, native text selection, native ⌘F. Live status footer with elapsed recording time and line count.
@@ -400,17 +400,26 @@ Persisted in `~/.meetink/config` as `me_name=Stijn`.
 
 By default, system-audio lines are labelled `THEM:`. With `/diarize on` and a profile-equipped sidecar, you get per-line speaker decisions:
 
-- **Enrolled profile match.** Each `/profile add <name>` records 3 × 5 s samples, embeds them via WeSpeaker, L2-normalises, averages into a centroid, persists as `<name>.npz`. At identify time, the top profile must clear cosine ≥ 0.65 *and* beat the runner-up by ≥ 0.07 — otherwise we don't claim a match.
+- **Enrolled profile match.** Each `/profile add <name>` records 3 × 5 s samples, embeds them via WeSpeaker, L2-normalises, then runs k-means to derive up to 3 cluster centroids (one for sparse profiles; more as samples accumulate). Persisted as `<name>.npz` with centroids, samples, cluster_ids, and per-sample timestamps. At identify time, the top profile must clear cosine ≥ 0.65 against its **best-matching** centroid *and* beat the runner-up by ≥ 0.07 — otherwise we don't claim a match.
 - **Online clustering fallback.** Unknown embeddings are grouped into in-memory clusters and labelled `THEM-A`, `THEM-B`, … so the live transcript still distinguishes voices. Cluster state is per-session (cleared on `/start`).
 - **Recovery.** After the meeting, `/profile assign A Alice` converts cluster A into a real profile *and* rewrites past `THEM-A` lines to `ALICE` in the transcript file. `/profile merge A B` folds two clusters together if one voice got split.
 
 Per-chunk diarization: each ~3 s WAV chunk is identified individually (synchronous, ~300 ms via the local sidecar) before the line is written, so the labels you see live are the same labels in the final file.
 
-Three controls let you tune accuracy per situation:
+Five controls let you tune accuracy. Three are session-level:
 
 - **Sensitivity preset** (`/diarize sensitivity focused|default|strict`) shifts THRESHOLD / MARGIN / CLUSTER_THRESHOLD as a coherent set. `/watch` picks one automatically based on attendee count.
 - **Per-session whitelist** (`/diarize whitelist alex stacey` or `/start alex stacey`) restricts `/identify` to a subset — the surgical fix for cross-meeting false-matches when a similar-sounding stranger is in the room.
 - **Auto-train** (`/diarize auto-train`, on by default) folds high-confidence matches back into the matched profile so it sharpens over time. Conservative guardrails (floor 0.88, 2× margin, min-samples 5) prevent the classic pollution failure mode; `/profile undo <name>` peels off any add you don't trust.
+
+Two are baked into the profile representation itself, so accuracy keeps improving as samples accumulate instead of plateauing:
+
+- **Multi-centroid k-means.** Each profile holds up to `PROFILE_MAX_CENTROIDS` (default 3) cluster centroids, re-derived on every mutation. `/identify` scores against the **best-matching** centroid, not the mean across all of them. Catches multimodal voices — same person on a headset vs laptop mic, calm work voice vs excited brainstorm voice — without averaging the modes into the middle of voice space where neither fits. K grows with sample count: 1 centroid until 10 samples, 2 by 20, 3 by 30 (capped).
+- **Time decay.** Centroid recomputation weights samples by `exp(-age / TAU)` (default TAU = 180 days). Recent samples dominate; old samples still contribute (1/e ≈ 37% weight at TAU). Profile tracks the speaker's current voice — new headset, recovered from a cold, different room acoustics — without losing the long-tail history. Set `MEETINK_PROFILE_TIME_DECAY_TAU_S=0` to disable.
+
+And one safety guard runs on **every** sample addition (`/enroll`, `/profile train`, `/profile assign`, `/profile rename`, auto-train):
+
+- **Outlier rejection.** A new sample's cosine against the profile's nearest existing centroid must clear `PROFILE_OUTLIER_FLOOR` (default 0.40, calibrated for 256-D WeSpeaker embeddings where same-speaker similarity ≥ 0.5 and distinct-speaker similarity < 0.4). Catches a different voice bleeding into a `/profile train` recording, or a `/profile rename` fold where the two profiles turn out to be different people (the original FLAVIO/BOB pollution failure). Rejected samples are surfaced in the response so you see "6 of 13 samples dropped as outliers" and know your assumption about cluster identity was wrong.
 
 ### `/watch` — auto-record from your calendar
 
@@ -663,7 +672,10 @@ Turn the watcher on once. It survives REPL restarts (config flag), polls Calenda
 ├── prompts/
 │   └── default.txt               Custom whisper vocabulary
 ├── profiles/
-│   ├── alice.npz                 Voice profile (centroid + sample count)
+│   ├── alice.npz                 Voice profile: centroids (K×D), samples (N×D),
+│   │                              cluster_ids (N), timestamps (N).
+│   │                              Legacy single-centroid files (pre-v0.1.1)
+│   │                              load fine and auto-migrate on first mutation.
 │   └── bob.npz
 ├── py-venv/                      Project venv (mlx-lm, prompt_toolkit, …)
 ├── diarize-venv/                 Diarize sidecar venv (sherpa-onnx, numpy)
@@ -749,6 +761,10 @@ Transcripts default to `~/Documents/meetink/` because they're your data — they
 | `MEETINK_AUTO_TRAIN_FLOOR` | `0.88` | Match cosine must clear this for auto-train to fire. |
 | `MEETINK_AUTO_TRAIN_MARGIN_MULT` | `2.0` | Top match must beat runner-up by ≥ N × the active MARGIN. |
 | `MEETINK_AUTO_TRAIN_MIN_SAMPLES` | `5` | Profile must already have this many samples before auto-train will add to it. |
+| `MEETINK_PROFILE_MAX_CENTROIDS` | `3` | Cap on k-means centroids per profile. Captures multimodal voice (different mics / moods / accents). Set to 1 to fall back to the old single-centroid representation. |
+| `MEETINK_PROFILE_SAMPLES_PER_CENTROID` | `10` | Threshold for adding another centroid. With defaults, profiles get K=1 until 10 samples, K=2 by 20, K=3 by 30, then capped. |
+| `MEETINK_PROFILE_OUTLIER_FLOOR` | `0.40` | Cosine ≥ this is required for a new sample to be accepted by `/enroll` / `/train` / `/assign` / `/rename` / auto-train. Rejected samples are reported back. Calibrated for 256-D WeSpeaker embeddings. |
+| `MEETINK_PROFILE_TIME_DECAY_TAU_S` | `15552000` (180 days) | TAU for `exp(-age/TAU)` sample weighting in centroid computation. Set to `0` to disable decay (uniform weights — the pre-v0.1.1 behaviour). |
 
 ### `~/.meetink/config` keys
 
