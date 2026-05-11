@@ -606,11 +606,29 @@ profile_add() {
         rm -f "$sample"
 
         if ! _resp_ok "$resp"; then
+            # Outlier-rejected sample (e.g. another speaker leaked in) is
+            # a planned non-OK response with rejected="outlier". Surface
+            # it clearly so the user can re-record without thinking the
+            # server crashed.
+            local rej=$(print -- "$resp" | sed -nE 's/.*"rejected":[[:space:]]*"([^"]+)".*/\1/p')
+            if [[ "$rej" == "outlier" ]]; then
+                local sim=$(print -- "$resp" | sed -nE 's/.*"best_sim":[[:space:]]*([0-9.]+).*/\1/p')
+                local floor=$(print -- "$resp" | sed -nE 's/.*"floor":[[:space:]]*([0-9.]+).*/\1/p')
+                print -P "  ${C[yellow]}⚠${C[reset]}  ${C[dim]}sample didn't match (cosine ${sim} < ${floor}) — re-record alone${C[reset]}"
+                (( i-- ))   # retry this sample slot
+                print ""
+                continue
+            fi
             print -P "  ${C[red]}server error:${C[reset]} $resp"
             return 1
         fi
         local total=$(print -- "$resp" | sed -nE 's/.*"samples":[[:space:]]*([0-9]+).*/\1/p')
-        print -P "  ${C[green]}✓${C[reset]} sample $i stored ${C[dim]}(profile total: $total)${C[reset]}"
+        local sim=$(print -- "$resp" | sed -nE 's/.*"best_sim":[[:space:]]*([0-9.]+).*/\1/p')
+        if [[ -n "$sim" ]]; then
+            print -P "  ${C[green]}✓${C[reset]} sample $i stored ${C[dim]}(profile total: $total, sim=${sim})${C[reset]}"
+        else
+            print -P "  ${C[green]}✓${C[reset]} sample $i stored ${C[dim]}(profile total: $total)${C[reset]}"
+        fi
         print ""
     done
 
@@ -654,10 +672,22 @@ profile_train() {
 
     if _resp_ok "$resp"; then
         local total=$(print -- "$resp" | sed -nE 's/.*"samples":[[:space:]]*([0-9]+).*/\1/p')
-        print -P "  ${C[green]}✓${C[reset]} added (total: $total samples)"
+        local sim=$(print -- "$resp" | sed -nE 's/.*"best_sim":[[:space:]]*([0-9.]+).*/\1/p')
+        if [[ -n "$sim" ]]; then
+            print -P "  ${C[green]}✓${C[reset]} added (total: $total samples, sim=${sim})"
+        else
+            print -P "  ${C[green]}✓${C[reset]} added (total: $total samples)"
+        fi
         _maybe_refresh_whitelist_from_attendees
     else
-        print -P "  ${C[red]}server error:${C[reset]} $resp"
+        local rej=$(print -- "$resp" | sed -nE 's/.*"rejected":[[:space:]]*"([^"]+)".*/\1/p')
+        if [[ "$rej" == "outlier" ]]; then
+            local sim=$(print -- "$resp" | sed -nE 's/.*"best_sim":[[:space:]]*([0-9.]+).*/\1/p')
+            local floor=$(print -- "$resp" | sed -nE 's/.*"floor":[[:space:]]*([0-9.]+).*/\1/p')
+            print -P "  ${C[yellow]}⚠${C[reset]}  ${C[dim]}sample rejected as outlier (cosine ${sim} < ${floor}) — wrong speaker leaked in, or voice has changed significantly${C[reset]}"
+        else
+            print -P "  ${C[red]}server error:${C[reset]} $resp"
+        fi
     fi
 }
 
@@ -782,7 +812,12 @@ profile_assign() {
         return 1
     fi
     local samples=$(print -- "$resp" | sed -nE 's/.*"samples":[[:space:]]*([0-9]+).*/\1/p')
-    print -P "${C[green]}✓${C[reset]} Saved profile ${C[bold]}$name${C[reset]} ${C[dim]}(from cluster $up_letter, $samples samples)${C[reset]}"
+    local added=$(print -- "$resp" | sed -nE 's/.*"added":[[:space:]]*([0-9]+).*/\1/p')
+    local rejected=$(print -- "$resp" | sed -nE 's/.*"rejected":[[:space:]]*([0-9]+).*/\1/p')
+    print -P "${C[green]}✓${C[reset]} Saved profile ${C[bold]}$name${C[reset]} ${C[dim]}(from cluster $up_letter, $samples samples total)${C[reset]}"
+    if [[ -n "$rejected" && "$rejected" != "0" ]]; then
+        print -P "  ${C[yellow]}⚠${C[reset]}  ${C[dim]}${rejected} of $(( ${added:-0} + ${rejected:-0} )) cluster samples dropped as outliers (didn't match the profile's voice)${C[reset]}"
+    fi
 
     local up_name=$(print -n -- "$name" | tr '[:lower:]' '[:upper:]')
     if [[ -L "$MK_TRANSCRIPT" ]] && _rewrite_transcript_label "$MK_TRANSCRIPT" "THEM-${up_letter}" "$up_name"; then
@@ -901,8 +936,12 @@ profile_rename() {
     fi
     local samples=$(print -- "$resp" | sed -nE 's/.*"samples":[[:space:]]*([0-9]+).*/\1/p')
     local merged=$(print -- "$resp" | sed -nE 's/.*"merged":[[:space:]]*(true|false).*/\1/p')
+    local rejected=$(print -- "$resp" | sed -nE 's/.*"rejected":[[:space:]]*([0-9]+).*/\1/p')
     if [[ "$merged" == "true" ]]; then
         print -P "${C[green]}✓${C[reset]} Folded ${C[bold]}$from${C[reset]} into ${C[bold]}$to${C[reset]} ${C[dim]}($samples samples total)${C[reset]}"
+        if [[ -n "$rejected" && "$rejected" != "0" ]]; then
+            print -P "  ${C[yellow]}⚠${C[reset]}  ${C[dim]}${rejected} sample(s) from ${from} dropped as outliers (likely a different speaker — protected ${to} from pollution)${C[reset]}"
+        fi
     else
         print -P "${C[green]}✓${C[reset]} Renamed ${C[bold]}$from${C[reset]} → ${C[bold]}$to${C[reset]} ${C[dim]}($samples samples)${C[reset]}"
     fi

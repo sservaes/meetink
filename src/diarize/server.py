@@ -80,6 +80,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -184,6 +185,49 @@ auto_train_settings: dict = {
 }
 
 
+# --- Profile representation tuning ----------------------------------------
+#
+# Three changes from the original "single centroid + uniform mean" model
+# that the user hit pollution issues with:
+#
+#   1. Outlier rejection. New samples must score ≥ OUTLIER_FLOOR against
+#      at least one existing centroid before being accepted. Catches the
+#      common failure modes: a different speaker briefly bleeding into a
+#      /profile train sample, or a /session/assign / /session/rename fold
+#      where the user mistakenly identifies two distinct speakers as one.
+#   2. k-means per profile. A single centroid can't represent multimodal
+#      voice (calm vs excited, headset vs laptop mic, etc.) — averaging
+#      them lands you in the middle of voice space, fitting neither
+#      mode. With up to MAX_CENTROIDS centroids per profile, matching
+#      scores against the *best* mode, not the mean of all modes.
+#   3. Time decay. Old samples are weighted exponentially less in the
+#      centroid computation, so the profile tracks the speaker's
+#      *current* voice characteristics (new headset, recovered from cold,
+#      etc.). Default TAU=180 days is conservative — recent samples
+#      dominate but old ones still meaningfully contribute.
+#
+# All three are conservative defaults; can be disabled / loosened via
+# env vars without code changes.
+PROFILE_MAX_CENTROIDS = int(os.environ.get("MEETINK_PROFILE_MAX_CENTROIDS", "3"))
+PROFILE_SAMPLES_PER_CENTROID = int(
+    os.environ.get("MEETINK_PROFILE_SAMPLES_PER_CENTROID", "10")
+)
+PROFILE_OUTLIER_FLOOR = float(
+    os.environ.get("MEETINK_PROFILE_OUTLIER_FLOOR", "0.40")
+)
+# Time decay TAU in seconds. 0 = disabled (uniform weights). Default
+# 180 days: a sample from TAU seconds ago has weight 1/e ≈ 0.37.
+PROFILE_TIME_DECAY_TAU_S = float(
+    os.environ.get(
+        "MEETINK_PROFILE_TIME_DECAY_TAU_S",
+        str(180 * 24 * 3600),
+    )
+)
+# Cap k-means iterations. Spherical k-means on ~100 samples × 3 centroids
+# converges in 5-10 iters; 20 is plenty of headroom.
+_KMEANS_MAX_ITERS = 20
+
+
 # --- Session whitelist ----------------------------------------------------
 #
 # When set, /identify only considers this subset of profiles. Voices that
@@ -220,8 +264,14 @@ def _maybe_auto_train(
         return False
     if profile["samples"].shape[0] < auto_train_settings["min_samples"]:
         return False
-    _add_sample(name, emb)
-    return True
+    # `_add_sample` runs the outlier check as well. An auto-train sample
+    # that scored 0.88+ in /identify will easily clear the 0.40 outlier
+    # floor, so this is effectively a no-op for legitimate matches —
+    # but it does protect against the edge case where the auto-train
+    # centroid is held together by old samples and the new one is
+    # actually from a similar-sounding stranger.
+    _, accepted, _ = _add_sample(name, emb, source="auto")
+    return accepted
 
 PROFILES_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -249,8 +299,21 @@ extractor = sherpa_onnx.SpeakerEmbeddingExtractor(
 
 
 # ---------------------------------------------------------------------------
-# Profile storage: each profile is {"centroid": 1×D, "samples": N×D},
-# samples are L2-normalised, centroid is the L2-normalised mean.
+# Profile storage
+#
+# Each profile dict contains:
+#   centroids    K×D float32  — K cluster centroids (L2-normalised). K is
+#                                derived from sample count, capped at
+#                                PROFILE_MAX_CENTROIDS.
+#   samples      N×D float32  — every enrollment / train / assign / auto
+#                                sample, in addition order.
+#   cluster_ids  N int32      — index into `centroids` for each sample.
+#   timestamps   N float64    — unix epoch per sample; drives time decay.
+#
+# On disk: .npz with the four fields above. The legacy single-centroid
+# format ({centroid, samples}) is loaded with cluster_ids all zero and
+# fake-old timestamps so existing profiles keep working until they get
+# re-saved (which happens on any mutation).
 # ---------------------------------------------------------------------------
 
 
@@ -259,8 +322,133 @@ def _l2(v: np.ndarray) -> np.ndarray:
     return v if n == 0.0 else v / n
 
 
+def _l2_rows(m: np.ndarray) -> np.ndarray:
+    """Row-wise L2-normalise an N×D matrix."""
+    norms = np.linalg.norm(m, axis=1, keepdims=True)
+    norms[norms == 0.0] = 1.0
+    return m / norms
+
+
 def _centroid(samples: np.ndarray) -> np.ndarray:
+    """Simple L2-normalised mean. Used by the in-memory session-cluster
+    state where multi-centroid + time-decay don't apply (clusters are
+    per-session, single-voice by definition)."""
     return _l2(samples.mean(axis=0))
+
+
+def _pick_k(n: int) -> int:
+    """Number of centroids for a profile with N samples. Single centroid
+    until we have enough samples to support more; capped at the env-tuned
+    MAX_CENTROIDS so we don't over-split."""
+    if n < PROFILE_SAMPLES_PER_CENTROID:
+        return 1
+    return min(PROFILE_MAX_CENTROIDS, max(1, n // PROFILE_SAMPLES_PER_CENTROID))
+
+
+def _time_weights(timestamps: np.ndarray) -> np.ndarray:
+    """exp(-(now - t) / TAU). Older samples get less weight in the
+    centroid. Returns ones if decay is disabled (TAU <= 0)."""
+    if PROFILE_TIME_DECAY_TAU_S <= 0:
+        return np.ones_like(timestamps, dtype=np.float64)
+    now = time.time()
+    ages = np.maximum(0.0, now - timestamps)
+    return np.exp(-ages / PROFILE_TIME_DECAY_TAU_S)
+
+
+def _farthest_point_init(samples: np.ndarray, k: int) -> list[int]:
+    """Pick K well-separated sample indices to seed k-means. Greedy:
+    start with sample 0, then iteratively add the sample with the lowest
+    max-cosine-similarity to the picked set. Robust on the unit sphere."""
+    n = samples.shape[0]
+    if k >= n:
+        return list(range(n))
+    seeds = [0]
+    for _ in range(k - 1):
+        sims = samples @ samples[seeds].T  # N×|seeds|
+        max_sims = np.max(sims, axis=1)
+        for s in seeds:
+            max_sims[s] = np.inf  # exclude already-picked
+        seeds.append(int(np.argmin(max_sims)))
+    return seeds
+
+
+def _kmeans(samples: np.ndarray, k: int) -> np.ndarray:
+    """Spherical k-means on L2-normalised embeddings. Returns an int32
+    array of cluster assignments (length N). Uses cosine (= dot product
+    on the unit sphere) as the similarity."""
+    n = samples.shape[0]
+    if k <= 1 or n <= 1:
+        return np.zeros(n, dtype=np.int32)
+    if k >= n:
+        # Each sample is its own cluster (degenerate but well-defined)
+        return np.arange(n, dtype=np.int32)
+
+    seed_idx = _farthest_point_init(samples, k)
+    centroids = samples[seed_idx].copy()
+
+    prev_assign: np.ndarray | None = None
+    for _ in range(_KMEANS_MAX_ITERS):
+        sims = samples @ centroids.T              # N×K cosine matrix
+        assign = np.argmax(sims, axis=1).astype(np.int32)
+        if prev_assign is not None and np.array_equal(assign, prev_assign):
+            break
+        # Recompute centroids as L2-normalised means of their members.
+        # Empty clusters (rare with farthest-point init) keep stale value.
+        for ci in range(k):
+            mask = assign == ci
+            if mask.any():
+                m = samples[mask].mean(axis=0)
+                norm = float(np.linalg.norm(m))
+                if norm > 0:
+                    centroids[ci] = (m / norm).astype(np.float32)
+        prev_assign = assign
+
+    return assign
+
+
+def _compute_centroids(
+    samples: np.ndarray,
+    cluster_ids: np.ndarray,
+    k: int,
+    timestamps: np.ndarray | None = None,
+) -> np.ndarray:
+    """L2-normalised time-weighted mean per cluster. Cluster with no
+    members gets a zero vector (won't match anything — fine)."""
+    d = samples.shape[1]
+    centroids = np.zeros((k, d), dtype=np.float32)
+    weights = _time_weights(timestamps) if timestamps is not None else None
+    for ci in range(k):
+        mask = cluster_ids == ci
+        if not mask.any():
+            continue
+        if weights is None:
+            mean_vec = samples[mask].mean(axis=0)
+        else:
+            w = weights[mask].astype(np.float32)
+            wsum = float(w.sum())
+            if wsum <= 0:
+                mean_vec = samples[mask].mean(axis=0)
+            else:
+                mean_vec = (samples[mask] * w[:, None]).sum(axis=0) / wsum
+        norm = float(np.linalg.norm(mean_vec))
+        if norm > 0:
+            centroids[ci] = (mean_vec / norm).astype(np.float32)
+    return centroids
+
+
+def _rebuild_profile(
+    samples: np.ndarray, timestamps: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Cluster samples + compute centroids. Returns (centroids, cluster_ids,
+    samples) — samples is returned for symmetry but unchanged."""
+    n = samples.shape[0]
+    k = _pick_k(n)
+    cluster_ids = _kmeans(samples, k)
+    # k might have been overridden by the degenerate case in _kmeans
+    actual_k = int(cluster_ids.max()) + 1 if n > 0 else 1
+    actual_k = max(actual_k, k)
+    centroids = _compute_centroids(samples, cluster_ids, actual_k, timestamps)
+    return centroids, cluster_ids, samples
 
 
 profiles: dict[str, dict] = {}
@@ -268,51 +456,235 @@ profiles: dict[str, dict] = {}
 
 def _load_all() -> None:
     profiles.clear()
-    # New format: .npz with `centroid` and `samples`
     for path in PROFILES_DIR.glob("*.npz"):
         try:
             data = np.load(path)
-            profiles[path.stem] = {
-                "centroid": data["centroid"].astype(np.float32),
-                "samples": data["samples"].astype(np.float32),
-            }
+            keys = set(data.files)
+            samples = data["samples"].astype(np.float32)
+            n = samples.shape[0]
+            if "centroids" in keys:
+                # New format with k centroids + per-sample metadata.
+                profiles[path.stem] = {
+                    "centroids": data["centroids"].astype(np.float32),
+                    "samples": samples,
+                    "cluster_ids": data["cluster_ids"].astype(np.int32),
+                    "timestamps": data["timestamps"].astype(np.float64),
+                }
+            else:
+                # Legacy: single "centroid" key. Synthesise the new fields
+                # with all samples in cluster 0 and a single old timestamp.
+                # First mutation re-clusters into the new format.
+                old_centroid = data["centroid"].astype(np.float32)
+                profiles[path.stem] = {
+                    "centroids": old_centroid[np.newaxis, :],
+                    "samples": samples,
+                    "cluster_ids": np.zeros(n, dtype=np.int32),
+                    "timestamps": np.full(
+                        n, time.time() - 30 * 24 * 3600, dtype=np.float64,
+                    ),
+                }
         except Exception as e:
-            print(f"warning: failed to load profile {path}: {e}", file=sys.stderr)
-    # Legacy format: .npy with a single embedding (treat as 1-sample profile)
+            print(
+                f"warning: failed to load profile {path}: {e}",
+                file=sys.stderr,
+            )
+    # Even-older format: .npy with one embedding (1-sample profile).
     for path in PROFILES_DIR.glob("*.npy"):
         if path.stem in profiles:
             continue
         try:
             emb = _l2(np.load(path).astype(np.float32))
             profiles[path.stem] = {
-                "centroid": emb,
+                "centroids": emb[np.newaxis, :],
                 "samples": emb[np.newaxis, :],
+                "cluster_ids": np.zeros(1, dtype=np.int32),
+                "timestamps": np.array(
+                    [time.time() - 30 * 24 * 3600], dtype=np.float64,
+                ),
             }
         except Exception as e:
-            print(f"warning: failed to load legacy profile {path}: {e}", file=sys.stderr)
+            print(
+                f"warning: failed to load legacy profile {path}: {e}",
+                file=sys.stderr,
+            )
 
 
 def _save(name: str) -> None:
     p = profiles[name]
-    np.savez(PROFILES_DIR / f"{name}.npz", centroid=p["centroid"], samples=p["samples"])
+    np.savez(
+        PROFILES_DIR / f"{name}.npz",
+        centroids=p["centroids"],
+        samples=p["samples"],
+        cluster_ids=p["cluster_ids"],
+        timestamps=p["timestamps"],
+    )
 
 
-def _add_sample(name: str, embedding: np.ndarray) -> int:
-    """Append a sample to a profile (creating it if new). Returns total sample count."""
-    new = _l2(embedding)[np.newaxis, :]
+def _outlier_reject(name: str, new_emb_l2: np.ndarray) -> tuple[bool, float]:
+    """Check whether `new_emb_l2` is too dissimilar from profile `name`'s
+    existing centroids to be the same speaker. Returns (rejected, best_sim).
+    No-op if the profile is new or empty."""
+    if name not in profiles:
+        return False, 1.0
+    centroids = profiles[name]["centroids"]
+    if centroids.shape[0] == 0:
+        return False, 1.0
+    sims = centroids @ new_emb_l2
+    best_sim = float(np.max(sims))
+    return best_sim < PROFILE_OUTLIER_FLOOR, best_sim
+
+
+def _add_sample(
+    name: str, embedding: np.ndarray, source: str = "manual",
+) -> tuple[int, bool, float]:
+    """Append a single sample to a profile. Re-clusters and re-saves.
+    Returns (total_samples_after, accepted, best_sim_against_existing).
+
+    `accepted = False` only when outlier rejection fires (sample's cosine
+    against every existing centroid is below PROFILE_OUTLIER_FLOOR).
+    Fresh profiles always accept.
+    """
+    new = _l2(embedding).astype(np.float32)
+    rejected, best_sim = _outlier_reject(name, new)
+    if rejected:
+        print(
+            f"outlier rejected: {name} "
+            f"(best_sim={best_sim:.3f} < {PROFILE_OUTLIER_FLOOR}, "
+            f"source={source})",
+            file=sys.stderr,
+        )
+        existing_n = (
+            profiles[name]["samples"].shape[0] if name in profiles else 0
+        )
+        return existing_n, False, best_sim
+
+    now = time.time()
     if name in profiles:
-        all_samples = np.vstack([profiles[name]["samples"], new])
+        all_samples = np.vstack([profiles[name]["samples"], new[None, :]])
+        all_timestamps = np.concatenate(
+            [profiles[name]["timestamps"], [now]]
+        )
     else:
-        all_samples = new
-    profiles[name] = {"centroid": _centroid(all_samples), "samples": all_samples}
+        all_samples = new[None, :]
+        all_timestamps = np.array([now], dtype=np.float64)
+
+    centroids, cluster_ids, all_samples = _rebuild_profile(
+        all_samples, all_timestamps,
+    )
+    profiles[name] = {
+        "centroids": centroids,
+        "samples": all_samples,
+        "cluster_ids": cluster_ids,
+        "timestamps": all_timestamps,
+    }
     _save(name)
-    return all_samples.shape[0]
+    return all_samples.shape[0], True, best_sim
+
+
+def _add_samples_bulk(
+    name: str,
+    embeddings: np.ndarray,
+    source: str = "manual",
+    skip_outliers: bool = True,
+) -> tuple[int, int]:
+    """Append M samples to a profile in one shot. Used by /session/assign
+    (folding a cluster into a profile) and /session/rename (merging two
+    profiles). Returns (added_count, rejected_count).
+
+    Outlier filtering applies the same per-sample floor as /enroll, so a
+    /session/assign of a cluster that *doesn't actually match* the target
+    profile drops the off-voice samples instead of polluting the centroid.
+    """
+    if embeddings.shape[0] == 0:
+        return 0, 0
+    new = _l2_rows(embeddings).astype(np.float32)
+
+    accepted_mask = np.ones(new.shape[0], dtype=bool)
+    if skip_outliers and name in profiles:
+        sims = new @ profiles[name]["centroids"].T  # M×K
+        max_sims = np.max(sims, axis=1)
+        accepted_mask = max_sims >= PROFILE_OUTLIER_FLOOR
+        rejected_count = int((~accepted_mask).sum())
+        if rejected_count:
+            print(
+                f"bulk outlier reject: {name} "
+                f"dropped {rejected_count}/{new.shape[0]} "
+                f"(source={source}, floor={PROFILE_OUTLIER_FLOOR})",
+                file=sys.stderr,
+            )
+    else:
+        rejected_count = 0
+
+    accepted = new[accepted_mask]
+    added = int(accepted.shape[0])
+    if added == 0:
+        return 0, rejected_count
+
+    now = time.time()
+    timestamps_new = np.full(added, now, dtype=np.float64)
+    if name in profiles:
+        all_samples = np.vstack([profiles[name]["samples"], accepted])
+        all_timestamps = np.concatenate(
+            [profiles[name]["timestamps"], timestamps_new]
+        )
+    else:
+        all_samples = accepted
+        all_timestamps = timestamps_new
+
+    centroids, cluster_ids, all_samples = _rebuild_profile(
+        all_samples, all_timestamps,
+    )
+    profiles[name] = {
+        "centroids": centroids,
+        "samples": all_samples,
+        "cluster_ids": cluster_ids,
+        "timestamps": all_timestamps,
+    }
+    _save(name)
+    return added, rejected_count
+
+
+def _trim_profile(name: str, count: int) -> tuple[int, int]:
+    """Drop the last `count` samples (and their metadata) from a profile,
+    re-cluster, re-save. Returns (removed, remaining)."""
+    p = profiles[name]
+    n = p["samples"].shape[0]
+    drop = min(count, n)
+    new_samples = p["samples"][:-drop] if drop > 0 else p["samples"]
+    new_timestamps = (
+        p["timestamps"][:-drop] if drop > 0 else p["timestamps"]
+    )
+    remaining = new_samples.shape[0]
+    centroids, cluster_ids, new_samples = _rebuild_profile(
+        new_samples, new_timestamps,
+    )
+    profiles[name] = {
+        "centroids": centroids,
+        "samples": new_samples,
+        "cluster_ids": cluster_ids,
+        "timestamps": new_timestamps,
+    }
+    _save(name)
+    return drop, remaining
 
 
 _load_all()
 print(
     f"loaded {len(profiles)} profile(s): "
-    + (", ".join(f"{k}({v['samples'].shape[0]})" for k, v in profiles.items()) or "(none)"),
+    + (
+        ", ".join(
+            f"{k}({v['samples'].shape[0]}s/{v['centroids'].shape[0]}c)"
+            for k, v in profiles.items()
+        )
+        or "(none)"
+    ),
+    file=sys.stderr,
+)
+print(
+    f"profile tuning: max_centroids={PROFILE_MAX_CENTROIDS} "
+    f"samples_per_centroid={PROFILE_SAMPLES_PER_CENTROID} "
+    f"outlier_floor={PROFILE_OUTLIER_FLOOR} "
+    f"time_decay_tau_days={PROFILE_TIME_DECAY_TAU_S / 86400:.0f}",
     file=sys.stderr,
 )
 
@@ -365,8 +737,16 @@ def identify(emb: np.ndarray) -> dict:
         if not candidates:
             return {"speaker": None, "confidence": 0.0, "runner_up": None, "runner_up_confidence": 0.0}
 
+    # Per-profile score is the cosine to the BEST-matching centroid (not
+    # a mean across centroids). Multimodal voices — same person with
+    # different recording conditions or mood — get their best mode used
+    # for matching instead of averaging modes into the middle.
+    emb_l2 = _l2(emb).astype(np.float32)
     sims = sorted(
-        ((name, cosine(emb, p["centroid"])) for name, p in candidates.items()),
+        (
+            (name, float(np.max(p["centroids"] @ emb_l2)))
+            for name, p in candidates.items()
+        ),
         key=lambda kv: kv[1],
         reverse=True,
     )
@@ -485,7 +865,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/profiles":
             self._json(200, {
                 "profiles": [
-                    {"name": n, "samples": int(p["samples"].shape[0])}
+                    {
+                        "name": n,
+                        "samples": int(p["samples"].shape[0]),
+                        "centroids": int(p["centroids"].shape[0]),
+                    }
                     for n, p in profiles.items()
                 ]
             })
@@ -581,25 +965,35 @@ class Handler(BaseHTTPRequestHandler):
                 if cluster is None:
                     self._json(404, {"error": f"no cluster named {letter}"})
                     return
-                # Promote the cluster's samples to a real profile. We
-                # vstack onto any existing samples so re-assigning into an
-                # existing name accumulates voice data rather than overwriting.
-                new_samples = cluster["samples"]
-                if name in profiles:
-                    new_samples = np.vstack([profiles[name]["samples"], new_samples])
-                profiles[name] = {
-                    "centroid": _centroid(new_samples),
-                    "samples": new_samples,
-                }
-                _save(name)
+                # Promote the cluster's samples to the profile via
+                # _add_samples_bulk so outlier rejection + k-means kick
+                # in. Re-assigning into an existing profile accumulates
+                # voice data; the outlier floor drops any cluster samples
+                # that clearly don't match the target's centroids (catches
+                # the failure mode where /profile assign A flavio is run
+                # on a cluster that's actually a different speaker).
+                added, rejected = _add_samples_bulk(
+                    name, cluster["samples"],
+                    source=f"assign:{letter}",
+                    # First-time profile creation: nothing to be outlier
+                    # vs, so skip the check on `name not in profiles`.
+                    skip_outliers=(name in profiles),
+                )
                 clusters.remove(cluster)
-                count = int(new_samples.shape[0])
-                print(f"session: cluster {letter} → profile {name} ({count} samples)", file=sys.stderr)
+                total = int(profiles[name]["samples"].shape[0])
+                print(
+                    f"session: cluster {letter} → profile {name} "
+                    f"(+{added} samples, {rejected} outliers rejected, "
+                    f"total={total})",
+                    file=sys.stderr,
+                )
                 self._json(200, {
                     "ok": True,
                     "cluster": letter,
                     "name": name,
-                    "samples": count,
+                    "samples": total,
+                    "added": added,
+                    "rejected": rejected,
                 })
                 return
             if url.path == "/session/merge":
@@ -779,22 +1173,27 @@ class Handler(BaseHTTPRequestHandler):
                     self._json(404, {"error": f"no profile named {src_name}"})
                     return
                 src_samples = profiles[src_name]["samples"]
+                src_timestamps = profiles[src_name]["timestamps"]
                 merged_into_existing = dst_name in profiles
+                rejected = 0
                 if merged_into_existing:
-                    # Fold: vstack onto dst, recompute centroid. This is the
-                    # common case when the same person was enrolled twice
-                    # under different names (e.g. bob and flavio).
-                    combined = np.vstack(
-                        [profiles[dst_name]["samples"], src_samples]
+                    # Fold via _add_samples_bulk so outlier rejection +
+                    # k-means kick in. This is exactly the FLAVIO/BOB
+                    # failure path — folding samples from a *different*
+                    # speaker would have polluted the destination
+                    # centroid. Now: each src sample is checked against
+                    # dst's centroids; ones that clearly don't match get
+                    # dropped with a per-source log line.
+                    _, rejected = _add_samples_bulk(
+                        dst_name, src_samples,
+                        source=f"rename:{src_name}",
+                        skip_outliers=True,
                     )
-                    profiles[dst_name] = {
-                        "centroid": _centroid(combined),
-                        "samples": combined,
-                    }
                 else:
-                    # Pure rename: rekey the in-memory entry, no recompute.
+                    # Pure rename: rekey, preserving all metadata. No
+                    # outlier check (nothing to compare against).
                     profiles[dst_name] = profiles[src_name]
-                _save(dst_name)
+                    _save(dst_name)
                 # Drop src from memory and disk regardless of which branch.
                 profiles.pop(src_name, None)
                 for ext in (".npz", ".npy"):
@@ -804,7 +1203,8 @@ class Handler(BaseHTTPRequestHandler):
                 count = int(profiles[dst_name]["samples"].shape[0])
                 print(
                     f"renamed: {src_name} → {dst_name} "
-                    f"({count} samples, merged={merged_into_existing})",
+                    f"({count} samples, merged={merged_into_existing}, "
+                    f"rejected={rejected})",
                     file=sys.stderr,
                 )
                 self._json(200, {
@@ -813,6 +1213,7 @@ class Handler(BaseHTTPRequestHandler):
                     "to": dst_name,
                     "samples": count,
                     "merged": merged_into_existing,
+                    "rejected": rejected,
                 })
                 return
             if url.path.startswith("/profiles/") and url.path.endswith("/pop"):
@@ -832,8 +1233,7 @@ class Handler(BaseHTTPRequestHandler):
                 if count < 1:
                     self._json(400, {"error": "count must be >= 1"})
                     return
-                samples = profiles[name]["samples"]
-                total = int(samples.shape[0])
+                total = int(profiles[name]["samples"].shape[0])
                 if count >= total:
                     self._json(400, {
                         "error": (
@@ -843,22 +1243,16 @@ class Handler(BaseHTTPRequestHandler):
                         ),
                     })
                     return
-                trimmed = samples[:-count]
-                profiles[name] = {
-                    "centroid": _centroid(trimmed),
-                    "samples": trimmed,
-                }
-                _save(name)
-                remaining = int(trimmed.shape[0])
+                removed, remaining = _trim_profile(name, count)
                 print(
-                    f"popped: {name} -{count} sample(s), "
+                    f"popped: {name} -{removed} sample(s), "
                     f"remaining={remaining}",
                     file=sys.stderr,
                 )
                 self._json(200, {
                     "ok": True,
                     "name": name,
-                    "removed": count,
+                    "removed": removed,
                     "remaining": remaining,
                 })
                 return
@@ -875,9 +1269,36 @@ class Handler(BaseHTTPRequestHandler):
                 if len(samples) < 16000 * 3:
                     self._json(400, {"error": "need >= 3s of audio"})
                     return
-                count = _add_sample(name, embed(samples))
-                print(f"enrolled: {name} ({len(samples) / 16000:.1f}s, total={count})", file=sys.stderr)
-                self._json(200, {"ok": True, "name": name, "samples": count})
+                count, accepted, best_sim = _add_sample(
+                    name, embed(samples), source="enroll",
+                )
+                if not accepted:
+                    # Outlier rejected. The sample's cosine vs every
+                    # existing centroid was below PROFILE_OUTLIER_FLOOR
+                    # — almost certainly a different voice slipped into
+                    # the recording. Surface the score so the caller
+                    # can show a helpful warning instead of silently
+                    # dropping.
+                    self._json(200, {
+                        "ok": False,
+                        "rejected": "outlier",
+                        "name": name,
+                        "samples": count,
+                        "best_sim": round(best_sim, 3),
+                        "floor": PROFILE_OUTLIER_FLOOR,
+                    })
+                    return
+                print(
+                    f"enrolled: {name} ({len(samples) / 16000:.1f}s, "
+                    f"total={count}, best_sim={best_sim:.3f})",
+                    file=sys.stderr,
+                )
+                self._json(200, {
+                    "ok": True,
+                    "name": name,
+                    "samples": count,
+                    "best_sim": round(best_sim, 3),
+                })
                 return
             self._json(404, {"error": "not found"})
         except Exception as e:
