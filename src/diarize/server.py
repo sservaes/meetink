@@ -958,6 +958,107 @@ class Handler(BaseHTTPRequestHandler):
                         )
                 self._json(200, resp)
                 return
+            if url.path == "/session/cluster/clear":
+                # Remove ONE cluster (vs /session/clear which wipes all).
+                # Use when a cluster has been contaminated with two voices
+                # so future /identify calls form fresh clusters per voice.
+                qs = parse_qs(url.query)
+                letter = (qs.get("letter", [""])[0]).strip().upper()
+                if not letter:
+                    self._json(400, {"error": "need ?letter=A"})
+                    return
+                cluster = _find_cluster(letter)
+                if cluster is None:
+                    self._json(404, {"error": f"no cluster named {letter}"})
+                    return
+                samples = int(cluster["samples"].shape[0])
+                clusters.remove(cluster)
+                print(
+                    f"session: cluster {letter} cleared ({samples} samples)",
+                    file=sys.stderr,
+                )
+                self._json(200, {
+                    "ok": True, "letter": letter, "cleared_samples": samples,
+                })
+                return
+            if url.path == "/session/cluster/split":
+                # Split one cluster into K via k-means on its samples.
+                # The original letter keeps the largest sub-cluster; the
+                # remaining sub-clusters get fresh letters allocated from
+                # _next_cluster_idx. Useful when a cluster has fused two
+                # similar-sounding speakers (strict sensitivity should
+                # prevent this, but vocally similar people can still slip
+                # through).
+                qs = parse_qs(url.query)
+                letter = (qs.get("letter", [""])[0]).strip().upper()
+                try:
+                    k = int(qs.get("k", ["2"])[0])
+                except ValueError:
+                    self._json(400, {"error": "k must be an integer"})
+                    return
+                if not letter or k < 2:
+                    self._json(400, {"error": "need ?letter=A and k >= 2"})
+                    return
+                cluster = _find_cluster(letter)
+                if cluster is None:
+                    self._json(404, {"error": f"no cluster named {letter}"})
+                    return
+                n = int(cluster["samples"].shape[0])
+                if n < k * 2:
+                    self._json(400, {
+                        "error": (
+                            f"cluster {letter} has only {n} samples; "
+                            f"need ≥ {k * 2} to split into {k}"
+                        ),
+                    })
+                    return
+
+                assignments = _kmeans(cluster["samples"], k)
+                # Find the largest sub-cluster — it keeps the original
+                # letter so existing transcript lines stay consistent.
+                sub_sizes = [int((assignments == i).sum()) for i in range(k)]
+                keeper_sub = int(np.argmax(sub_sizes))
+
+                new_letters: list[str] = []
+                global _next_cluster_idx
+                # Re-assign each sub-cluster
+                old_samples = cluster["samples"]
+                for sub_i in range(k):
+                    mask = assignments == sub_i
+                    sub_samples = old_samples[mask]
+                    if sub_samples.shape[0] == 0:
+                        continue
+                    sub_centroid = _centroid(sub_samples)
+                    if sub_i == keeper_sub:
+                        # Mutate the original cluster in place
+                        cluster["samples"] = sub_samples
+                        cluster["centroid"] = sub_centroid
+                    else:
+                        # Allocate a fresh letter
+                        new_letter = _letter_for(_next_cluster_idx)
+                        _next_cluster_idx += 1
+                        clusters.append({
+                            "letter": new_letter,
+                            "centroid": sub_centroid,
+                            "samples": sub_samples,
+                        })
+                        new_letters.append(new_letter)
+
+                print(
+                    f"session: cluster {letter} split into "
+                    f"{[letter] + new_letters} "
+                    f"(sizes: {[sub_sizes[keeper_sub]] + [sub_sizes[i] for i in range(k) if i != keeper_sub]})",
+                    file=sys.stderr,
+                )
+                self._json(200, {
+                    "ok": True,
+                    "letter": letter,
+                    "new_letters": new_letters,
+                    "sizes": [sub_sizes[keeper_sub]] + [
+                        sub_sizes[i] for i in range(k) if i != keeper_sub
+                    ],
+                })
+                return
             if url.path == "/session/clear":
                 session_clear()
                 print("session: clusters cleared", file=sys.stderr)

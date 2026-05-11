@@ -881,6 +881,63 @@ PY
     print -P "  ${C[dim]}Whitelist updated:${C[reset]} ${C[bright_cyan]}${pretty}${C[reset]}"
 }
 
+# Wipe one live cluster (vs /diarize on, which clears all). Use when
+# a single cluster letter has accumulated two distinct voices and you
+# want future /identify calls to re-cluster them as separate letters.
+# Past transcript lines tagged with that letter stay tagged — fix
+# manually after /stop if needed.
+cluster_clear() {
+    local letter="$1"
+    if [[ -z "$letter" ]]; then
+        print -P "${C[red]}usage:${C[reset]} /profile clear <letter>"
+        return 1
+    fi
+    if ! diarize_running; then
+        print -P "${C[red]}error:${C[reset]} diarize-server not running"
+        return 1
+    fi
+    local up_letter=$(print -n -- "$letter" | tr '[:lower:]' '[:upper:]')
+    local resp=$(curl -s -X POST \
+        "http://127.0.0.1:$MK_DIARIZE_PORT/session/cluster/clear?letter=$up_letter")
+    if ! _resp_ok "$resp"; then
+        print -P "${C[red]}error:${C[reset]} $resp"
+        return 1
+    fi
+    local cleared=$(print -- "$resp" | sed -nE 's/.*"cleared_samples":[[:space:]]*([0-9]+).*/\1/p')
+    print -P "${C[green]}✓${C[reset]} Cluster ${C[bold]}THEM-${up_letter}${C[reset]} cleared ${C[dim]}(${cleared} samples discarded — past transcript labels unchanged)${C[reset]}"
+}
+
+# Run k-means on a cluster's samples and split into K sub-clusters.
+# The original letter keeps the largest sub-cluster; new letters are
+# allocated for the rest. Useful when strict sensitivity wasn't enough
+# to keep two vocally-similar speakers apart and they ended up fused.
+cluster_split() {
+    local letter="$1" k="${2:-2}"
+    if [[ -z "$letter" ]]; then
+        print -P "${C[red]}usage:${C[reset]} /profile split <letter> [k]"
+        return 1
+    fi
+    if ! [[ "$k" =~ ^[0-9]+$ ]] || (( k < 2 )); then
+        print -P "${C[red]}error:${C[reset]} k must be an integer >= 2"
+        return 1
+    fi
+    if ! diarize_running; then
+        print -P "${C[red]}error:${C[reset]} diarize-server not running"
+        return 1
+    fi
+    local up_letter=$(print -n -- "$letter" | tr '[:lower:]' '[:upper:]')
+    local resp=$(curl -s -X POST \
+        "http://127.0.0.1:$MK_DIARIZE_PORT/session/cluster/split?letter=$up_letter&k=$k")
+    if ! _resp_ok "$resp"; then
+        print -P "${C[red]}error:${C[reset]} $resp"
+        return 1
+    fi
+    local new_letters=$(print -- "$resp" | sed -nE 's/.*"new_letters":[[:space:]]*\[([^]]*)\].*/\1/p' | sed 's/"//g')
+    local sizes=$(print -- "$resp" | sed -nE 's/.*"sizes":[[:space:]]*\[([^]]*)\].*/\1/p')
+    print -P "${C[green]}✓${C[reset]} Split ${C[bold]}THEM-${up_letter}${C[reset]} into ${C[bold]}${up_letter}, ${new_letters}${C[reset]} ${C[dim]}(sample sizes: ${sizes})${C[reset]}"
+    print -P "  ${C[dim]}Past transcript lines tagged THEM-${up_letter} stay tagged — only future /identify calls route to the right sub-cluster.${C[reset]}"
+}
+
 # Pop the last N samples off a profile and recompute its centroid.
 # Useful when /profile train picked up a stray voice — undo last sample,
 # don't trash the whole profile and re-enroll.
@@ -1000,6 +1057,8 @@ cmd_profile() {
         merge)                 profile_merge   "$2" "$3" ;;
         rename|mv)             profile_rename  "$2" "$3" ;;
         undo|pop)              profile_undo    "$2" "$3" ;;
+        clear)                 cluster_clear   "$2" ;;
+        split)                 cluster_split   "$2" "$3" ;;
         *)
             print -P "${C[red]}unknown:${C[reset]} ${C[dim]}/profile $sub${C[reset]}"
             print -P "  ${C[dim]}/profile add <name>${C[reset]}              enroll a new voice (3 samples)"

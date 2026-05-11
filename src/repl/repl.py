@@ -904,6 +904,8 @@ _NESTED_COMMANDS = {
         "merge": None,
         "rename": _profile_names_completer,
         "undo": _profile_names_completer,
+        "clear": None,
+        "split": None,
     },
     "/project": {
         "list": None,
