@@ -624,6 +624,12 @@ class WatchManager:
                 e for e in self._events.values()
                 if e.status in (EventStatus.NOTIFIED, EventStatus.DEFERRED)
                 and e.start <= now <= e.end
+                # Synthetic instant-meeting events are owned by the
+                # _maybe_start_instant_recording worker thread — that
+                # path handles its own notification + /start. If this
+                # sweep also picks them up, two parallel /start calls
+                # race and one logs "/start failed: Already recording".
+                and e.detected_source is None
             ]
             if not ready:
                 return
