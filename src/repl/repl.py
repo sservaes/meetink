@@ -362,6 +362,77 @@ def _ram_free_gb() -> float:
 FOOTER_SEP = "\033[90m │ \033[0m"
 
 
+# Cached fetch of the diarize-server's root state (preset, auto-train
+# counters, etc.). Footer ticks every 1s but server state only shifts
+# on /diarize sensitivity, /watch auto-tune, or auto-train fires —
+# cache for 3s so the localhost GET cost stays bounded. One fetch
+# powers both the sensitivity chip and the auto-train chip.
+_diarize_state_cache: dict = {"data": None, "ts": 0.0}
+
+
+def _diarize_state() -> dict | None:
+    """Cached snapshot of the diarize-server's root response. Returns
+    None when the server is unreachable so callers can suppress chips
+    without a per-call try/except."""
+    now = time.time()
+    if now - _diarize_state_cache["ts"] < 3.0:
+        return _diarize_state_cache["data"]
+    data: dict | None = None
+    try:
+        import json
+        import urllib.request
+        port = int(os.environ.get("MEETINK_DIARIZE_PORT", "8179"))
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/", timeout=0.5,
+        ) as r:
+            data = json.loads(r.read())
+    except Exception:
+        data = None
+    _diarize_state_cache["data"] = data
+    _diarize_state_cache["ts"] = now
+    return data
+
+
+def _diarize_sensitivity_preset() -> str | None:
+    """Active sensitivity preset name ('focused' / 'default' / 'strict'
+    / 'custom'), or None if the diarize-server isn't reachable."""
+    data = _diarize_state()
+    return data.get("preset") if data else None
+
+
+def _auto_train_chip() -> str:
+    """Footer chip showing this session's auto-train activity. Hidden
+    until at least one sample has been auto-trained — chip is signal-
+    only, no zero-state noise. Fades to grey when nothing happened in
+    the last 60s; cyan when there's recent activity."""
+    data = _diarize_state()
+    if not data:
+        return ""
+    total = int(data.get("auto_train_total", 0) or 0)
+    recent = int(data.get("auto_train_recent_60s", 0) or 0)
+    if total == 0:
+        return ""
+    last = data.get("auto_train_last") or {}
+    name = last.get("name", "")
+    if recent > 0:
+        if name:
+            return f"\033[36m🎯 +{total} auto · {name}\033[0m"
+        return f"\033[36m🎯 +{total} auto\033[0m"
+    return f"\033[90m🎯 +{total} auto\033[0m"
+
+
+def _watch_chip_visible() -> bool:
+    """The watch chip is only meaningful when the WatchManager subsystem
+    is importable AND the underlying agent binary is present. Avoid
+    surfacing a stale toggle on partial installs."""
+    try:
+        from watch import WatchManager  # type: ignore[import-not-found]
+    except ImportError:
+        return False
+    agent = MK_HOME / "bin" / "MeetinkAgent.app" / "Contents" / "MacOS" / "meetink-agent"
+    return agent.is_file()
+
+
 # Cached chip for the RAG indexer. File-IO-light, but the footer ticks
 # every 1s; cache the rendered string for 2s so we don't stat the .idx
 # dir every refresh.
@@ -438,6 +509,12 @@ def _footer_top_raw() -> str:
     elif diarize_running():
         n = profile_count()
         label = f"{n} profile" + ("s" if n != 1 else "")
+        # Append the active sensitivity preset so users always see which
+        # threshold/margin set is in effect — easy to forget after a
+        # `/watch`-driven auto-tune or a manual `/diarize sensitivity`.
+        preset = _diarize_sensitivity_preset()
+        if preset:
+            label = f"{label} · {preset}"
         parts.append(f"\033[36m👤 {label}\033[0m")
     elif is_running():
         parts.append("\033[33m👤 starting\033[0m")
@@ -447,6 +524,23 @@ def _footer_top_raw() -> str:
             parts.append(f"\033[36m👤 {n} enrolled\033[0m")
         else:
             parts.append("\033[36m👤 ready\033[0m")
+
+    # Watch chip — on/off mirrors the persisted flag so a REPL restart
+    # surfaces the same state. Hidden when the watcher subsystem isn't
+    # available (e.g. agent app missing) so we don't dangle a meaningless
+    # toggle.
+    if _watch_chip_visible():
+        if _watch_enabled_get():
+            parts.append("\033[36m👁 watch on\033[0m")
+        else:
+            parts.append("\033[90m👁 watch off\033[0m")
+
+    # Auto-train chip: only renders when something actually got auto-
+    # trained this session, so users get positive feedback that the
+    # background self-improvement loop is working.
+    auto_chip = _auto_train_chip()
+    if auto_chip:
+        parts.append(auto_chip)
 
     if llm_available():
         parts.append(f"\033[36m✨ {_titling_label()}\033[0m")

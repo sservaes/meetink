@@ -73,6 +73,15 @@ POST   /session/whitelist?profiles=alex,stacey
                                       when going into a meeting with people
                                       who aren't all enrolled.
 POST   /session/whitelist?clear=true  drop the whitelist (match all profiles)
+POST   /session/adopt-last?name=Mike&age_max_s=20
+                                      pull the most recent /identify
+                                      embedding (system audio, i.e. someone
+                                      else's voice) and append it to profile
+                                      `name`. Powers /profile train mid-
+                                      meeting so the user can click "train
+                                      Mike" right after Mike speaks and
+                                      actually grab Mike's voice, not their
+                                      own mic input.
 """
 
 from __future__ import annotations
@@ -128,6 +137,16 @@ PRESETS: dict[str, dict[str, float]] = {
 # /session/sensitivity update takes effect on the very next /identify
 # without a server restart. Env-var overrides at boot still win on the
 # initial read; presets are applied on top of them when chosen.
+#
+# `single_profile_floor` patches a real correctness hole: when /identify
+# only has ONE candidate (whitelist of size 1, or only one enrolled
+# profile), the MARGIN check is meaningless because runner-up similarity
+# defaults to -1.0 and `top - (-1.0)` always exceeds MARGIN. So a Mike-
+# voice scoring 0.68 against Ethan would confidently get labeled ETHAN
+# even though it's clearly not him by absolute confidence. The floor
+# raises the bar in that case (default 0.78 — about 13pp above the
+# default THRESHOLD of 0.65, well into "this is really the same speaker"
+# territory). Set to <= THRESHOLD to disable the extra check.
 settings: dict[str, float] = {
     "threshold": float(os.environ.get(
         "MEETINK_DIARIZE_THRESHOLD",
@@ -140,6 +159,24 @@ settings: dict[str, float] = {
     "cluster_threshold": float(os.environ.get(
         "MEETINK_DIARIZE_CLUSTER_THRESHOLD",
         str(PRESETS["default"]["cluster_threshold"]),
+    )),
+    "single_profile_floor": float(os.environ.get(
+        "MEETINK_DIARIZE_SINGLE_FLOOR", "0.78",
+    )),
+    # Close-pair adaptive margin. When the top profile and runner-up
+    # cross-match heavily (cross-sim ≥ close_pair_threshold), the
+    # WeSpeaker embedding model literally cannot separate them by much,
+    # so the standard MARGIN requirement makes the call un-labelable.
+    # In that regime, even a small consistent advantage in audio score
+    # is meaningful (Alex's voice systematically scores slightly higher
+    # on Alex than Ethan despite the centroid overlap). Drop to a much
+    # smaller floor — the THRESHOLD gate still protects against
+    # absolute-low scores from unrelated voices.
+    "close_pair_threshold": float(os.environ.get(
+        "MEETINK_DIARIZE_CLOSE_PAIR_THRESHOLD", "0.80",
+    )),
+    "close_pair_margin": float(os.environ.get(
+        "MEETINK_DIARIZE_CLOSE_PAIR_MARGIN", "0.03",
     )),
 }
 # Track which preset (if any) the user explicitly selected, so GET
@@ -182,7 +219,28 @@ auto_train_settings: dict = {
     "min_samples": int(
         os.environ.get("MEETINK_AUTO_TRAIN_MIN_SAMPLES", "5"),
     ),
+    # Hysteresis floor on profile tightness. When tightness drops below
+    # this — meaning recent samples are clustering loosely or pulling
+    # the centroid apart — auto-train is suspended for that profile
+    # until the user manually intervenes (re-train, /profile rm-then-
+    # re-add, /profile assign from a fresh cluster). Catches runaway
+    # drift: once a non-target voice gets confidently auto-trained in,
+    # subsequent /identify scores skew, more wrong samples land, the
+    # centroid keeps drifting. Pausing auto-train when tightness drops
+    # gives the user a window to fix it before it snowballs.
+    "tightness_floor": float(
+        os.environ.get("MEETINK_AUTO_TRAIN_TIGHTNESS_FLOOR", "0.75"),
+    ),
 }
+
+
+# Auto-train activity log so the REPL footer / /profile output can show
+# users when auto-train is actually doing useful work. Without this,
+# auto-train was a black box — samples would silently grow (or not) and
+# users had no signal beyond /diarize log. Capped at 100 to bound memory
+# (the count metric is unbounded; the per-event detail is tail-only).
+_auto_train_log: list[dict] = []
+_AUTO_TRAIN_LOG_MAX = 100
 
 
 # --- Profile representation tuning ----------------------------------------
@@ -241,6 +299,33 @@ _KMEANS_MAX_ITERS = 20
 session_whitelist: "list[str] | None" = None
 
 
+# --- Recent embedding ring -------------------------------------------------
+#
+# /profile train <name> mid-meeting used to record from the user's mic,
+# which is the wrong stream for training someone else (the call audio is
+# the system stream — heard via the capture binary's ScreenCaptureKit
+# pipeline, which POSTs 10 s windows here to /identify). Result: every
+# `train` call appended room tone / breathing to the target profile and
+# polluted the centroid away from the actual speaker.
+#
+# The ring keeps the most-recent N embeddings seen by /identify so the
+# `/session/adopt-last` endpoint can grab the latest one and fold it
+# into the right profile. N is small (10) because the relevant window
+# is "what just happened in the meeting" — a 10 s identify cadence ×
+# 10 entries = ~100 s of history, plenty for a click-after-speaking
+# UX. 256-D embeddings at float32 = 1 KB each, so the ring is ~10 KB.
+_recent_embeddings: list[dict] = []
+_RECENT_RING_MAX = 10
+
+
+def _push_recent_embedding(emb: np.ndarray) -> None:
+    """Append a copy of `emb` to the ring, evict oldest if over cap.
+    Stores a copy so caller-side mutation can't corrupt history."""
+    _recent_embeddings.append({"ts": time.time(), "emb": emb.copy()})
+    while len(_recent_embeddings) > _RECENT_RING_MAX:
+        _recent_embeddings.pop(0)
+
+
 def _maybe_auto_train(
     emb: np.ndarray,
     name: str,
@@ -264,6 +349,19 @@ def _maybe_auto_train(
         return False
     if profile["samples"].shape[0] < auto_train_settings["min_samples"]:
         return False
+    # Hysteresis guard: if the profile's recent samples have started
+    # spreading (tightness < floor), don't accelerate the drift by
+    # adding more auto-train samples. The user can resume by manually
+    # /profile train (which forces an /enroll regardless of tightness)
+    # or by re-establishing a clean profile.
+    tight = _profile_tightness(profile)
+    if tight < auto_train_settings["tightness_floor"]:
+        print(
+            f"auto-train suspended for {name}: tightness {tight:.3f} < "
+            f"floor {auto_train_settings['tightness_floor']:.3f}",
+            file=sys.stderr,
+        )
+        return False
     # `_add_sample` runs the outlier check as well. An auto-train sample
     # that scored 0.88+ in /identify will easily clear the 0.40 outlier
     # floor, so this is effectively a no-op for legitimate matches —
@@ -271,6 +369,13 @@ def _maybe_auto_train(
     # centroid is held together by old samples and the new one is
     # actually from a similar-sounding stranger.
     _, accepted, _ = _add_sample(name, emb, source="auto")
+    if accepted:
+        _auto_train_log.append({
+            "ts": time.time(), "name": name,
+            "confidence": round(confidence, 3),
+        })
+        while len(_auto_train_log) > _AUTO_TRAIN_LOG_MAX:
+            _auto_train_log.pop(0)
     return accepted
 
 PROFILES_DIR.mkdir(parents=True, exist_ok=True)
@@ -656,6 +761,41 @@ def _add_samples_bulk(
     return added, rejected_count
 
 
+def _profile_tightness(p: dict) -> float:
+    """Mean of (sample · best-centroid) across the profile's samples.
+    1.0 = every sample sits exactly on a centroid (single-mode, very
+    tight). 0.7 = samples spread across multiple modes; 0.5 or below
+    typically means pollution from another speaker. Useful diagnostic
+    when /identify keeps mis-routing — a low-tightness profile won't
+    match its own speaker reliably either.
+    """
+    samples = p["samples"]
+    if samples.shape[0] == 0:
+        return 0.0
+    sims = samples @ p["centroids"].T   # N×K cosine matrix
+    return float(np.mean(np.max(sims, axis=1)))
+
+
+def _profile_nearest(name: str, p: dict) -> dict | None:
+    """Closest other profile by best-centroid-vs-best-centroid cosine.
+    Surfaces "Mike's profile is 0.84 away from Ethan" — the proximate
+    cause of cross-matching. Returns None when there's only one profile.
+    """
+    best_name: str | None = None
+    best_sim = -1.0
+    for other_name, other in profiles.items():
+        if other_name == name:
+            continue
+        cross = p["centroids"] @ other["centroids"].T
+        sim = float(np.max(cross))
+        if sim > best_sim:
+            best_sim = sim
+            best_name = other_name
+    if best_name is None:
+        return None
+    return {"name": best_name, "sim": round(best_sim, 3)}
+
+
 def _trim_profile(name: str, count: int) -> tuple[int, int]:
     """Drop the last `count` samples (and their metadata) from a profile,
     re-cluster, re-save. Returns (removed, remaining)."""
@@ -765,15 +905,82 @@ def identify(emb: np.ndarray) -> dict:
     top_name, top_sim = sims[0]
     second_name, second_sim = (sims[1] if len(sims) > 1 else (None, -1.0))
 
-    accepted = (
-        top_sim >= settings["threshold"]
-        and (top_sim - second_sim) >= settings["margin"]
-    )
+    # Single-candidate path: no runner-up to disambiguate against, so
+    # the margin check is trivially satisfied. Require a higher absolute
+    # floor instead — otherwise any voice that vaguely resembles the
+    # only candidate confidently gets labeled (today's Mike-as-Ethan
+    # failure mode). When two or more candidates exist, the standard
+    # threshold + margin gates apply, *unless* the top two profiles
+    # cross-match heavily (close-pair mode — see comment above the
+    # settings dict).
+    reason: str | None = None
+    close_pair = False
+    if len(sims) == 1:
+        accepted = top_sim >= settings["single_profile_floor"]
+        if not accepted:
+            reason = "below_single_floor"
+    else:
+        # Compute centroid-vs-centroid cosine between the top two
+        # profiles. When it's high, two real-different speakers sit
+        # close in WeSpeaker space and the standard MARGIN cannot be
+        # satisfied — drop to a smaller floor that lets the consistent
+        # advantage carry the decision.
+        top_p = candidates[top_name]
+        runner_p = candidates[second_name]
+        cross_sim = float(np.max(top_p["centroids"] @ runner_p["centroids"].T))
+        close_pair = cross_sim >= settings["close_pair_threshold"]
+        effective_margin = (
+            settings["close_pair_margin"] if close_pair else settings["margin"]
+        )
+        if top_sim < settings["threshold"]:
+            accepted = False
+            reason = "below_threshold"
+        elif (top_sim - second_sim) < effective_margin:
+            accepted = False
+            reason = (
+                "below_close_pair_margin" if close_pair else "below_margin"
+            )
+        else:
+            accepted = True
+    # Stderr-log every rejection with the gate that failed and the gap.
+    # This is the missing diagnostic users have been hitting: their
+    # enrolled person silently falls to THEM-X with no signal as to why.
+    # `/diarize log` (tails the same file) now surfaces it.
+    if not accepted:
+        if reason == "below_single_floor":
+            print(
+                f"identify reject: {top_name} top_sim={top_sim:.3f} < "
+                f"single_floor={settings['single_profile_floor']}",
+                file=sys.stderr,
+            )
+        elif reason == "below_threshold":
+            print(
+                f"identify reject: {top_name} top_sim={top_sim:.3f} < "
+                f"threshold={settings['threshold']}",
+                file=sys.stderr,
+            )
+        elif reason == "below_margin":
+            print(
+                f"identify reject: {top_name}@{top_sim:.3f} vs "
+                f"{second_name}@{second_sim:.3f} gap="
+                f"{top_sim - second_sim:.3f} < margin={settings['margin']}",
+                file=sys.stderr,
+            )
+        elif reason == "below_close_pair_margin":
+            print(
+                f"identify reject: close-pair {top_name}@{top_sim:.3f} vs "
+                f"{second_name}@{second_sim:.3f} gap="
+                f"{top_sim - second_sim:.3f} < close_pair_margin="
+                f"{settings['close_pair_margin']}",
+                file=sys.stderr,
+            )
     return {
         "speaker": top_name if accepted else None,
         "confidence": round(top_sim, 3),
         "runner_up": second_name,
         "runner_up_confidence": round(second_sim, 3) if second_sim > -1.0 else None,
+        "reason": reason,
+        "close_pair": close_pair,
     }
 
 
@@ -841,6 +1048,12 @@ def session_clear() -> None:
     global _next_cluster_idx
     clusters.clear()
     _next_cluster_idx = 0
+    # Auto-train log is a per-session counter; resetting it on /start
+    # makes the footer chip honestly track THIS recording's activity.
+    _auto_train_log.clear()
+    # Recent-embedding ring is also per-session; carrying it across
+    # /start would let /profile train adopt audio from a previous call.
+    _recent_embeddings.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -863,15 +1076,83 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = urlparse(self.path).path
         if path == "/":
+            now = time.time()
+            recent_60s = [e for e in _auto_train_log if now - e["ts"] <= 60]
+            last = _auto_train_log[-1] if _auto_train_log else None
             self._json(200, {
                 "status": "ok",
                 "profiles": list(profiles.keys()),
                 "threshold": settings["threshold"],
                 "margin": settings["margin"],
                 "cluster_threshold": settings["cluster_threshold"],
+                "single_profile_floor": settings["single_profile_floor"],
                 "preset": settings_preset,
                 "clusters": len(clusters),
                 "whitelist": session_whitelist,
+                "auto_train_total": len(_auto_train_log),
+                "auto_train_recent_60s": len(recent_60s),
+                "auto_train_last": (
+                    {
+                        "name": last["name"],
+                        "age_s": round(now - last["ts"], 1),
+                    } if last else None
+                ),
+            })
+            return
+        if path.startswith("/profiles/") and path.endswith("/diagnose"):
+            name = path[len("/profiles/"):-len("/diagnose")].strip()
+            if not name or name not in profiles:
+                self._json(404, {"error": f"no profile named {name}"})
+                return
+            p = profiles[name]
+            # Per-centroid sample distribution (which sub-cluster each
+            # sample belongs to). Useful when figuring out whether the
+            # profile is uni-modal or has splintered into noticeable
+            # voice modes (e.g. headset vs laptop mic).
+            cluster_ids = p["cluster_ids"]
+            samples_per_centroid: list[int] = []
+            for ci in range(p["centroids"].shape[0]):
+                samples_per_centroid.append(int((cluster_ids == ci).sum()))
+            # All cross-profile similarities, not just the nearest. Sorted
+            # descending so the worst cross-match offenders surface first.
+            cross: list[dict] = []
+            for other_name, other in profiles.items():
+                if other_name == name:
+                    continue
+                sim = float(np.max(p["centroids"] @ other["centroids"].T))
+                cross.append({"name": other_name, "sim": round(sim, 3)})
+            cross.sort(key=lambda kv: kv["sim"], reverse=True)
+            # Auto-train events targeting this profile
+            now = time.time()
+            recent_auto = [
+                {
+                    "ts": e["ts"],
+                    "age_s": round(now - e["ts"], 1),
+                    "confidence": e.get("confidence"),
+                }
+                for e in _auto_train_log if e["name"] == name
+            ]
+            self._json(200, {
+                "name": name,
+                "samples": int(p["samples"].shape[0]),
+                "centroids": int(p["centroids"].shape[0]),
+                "samples_per_centroid": samples_per_centroid,
+                "tightness": round(_profile_tightness(p), 3),
+                "cross_similarities": cross,
+                "auto_train_events": recent_auto,
+                "whitelist_member": (
+                    session_whitelist is None or name in session_whitelist
+                ),
+            })
+            return
+        if path == "/session/auto-train-recent":
+            now = time.time()
+            self._json(200, {
+                "events": [
+                    {**e, "age_s": round(now - e["ts"], 1)}
+                    for e in _auto_train_log[-20:]
+                ],
+                "total": len(_auto_train_log),
             })
             return
         if path == "/profiles":
@@ -881,6 +1162,8 @@ class Handler(BaseHTTPRequestHandler):
                         "name": n,
                         "samples": int(p["samples"].shape[0]),
                         "centroids": int(p["centroids"].shape[0]),
+                        "tightness": round(_profile_tightness(p), 3),
+                        "nearest": _profile_nearest(n, p),
                     }
                     for n, p in profiles.items()
                 ]
@@ -892,6 +1175,9 @@ class Handler(BaseHTTPRequestHandler):
                 "threshold": settings["threshold"],
                 "margin": settings["margin"],
                 "cluster_threshold": settings["cluster_threshold"],
+                "single_profile_floor": settings["single_profile_floor"],
+                "close_pair_threshold": settings["close_pair_threshold"],
+                "close_pair_margin": settings["close_pair_margin"],
                 "available": list(PRESETS.keys()),
             })
             return
@@ -925,6 +1211,10 @@ class Handler(BaseHTTPRequestHandler):
                     self._json(200, {"speaker": None, "confidence": 0.0, "reason": "too_short"})
                     return
                 emb = embed(samples)
+                # Push into the recent-embedding ring before any matching so
+                # /session/adopt-last works even when identify returns None
+                # (the user wants to /profile train an unmatched voice).
+                _push_recent_embedding(emb)
                 result = identify(emb)
                 resp = dict(result)
                 if resp["speaker"] is None:
@@ -1057,6 +1347,64 @@ class Handler(BaseHTTPRequestHandler):
                     "sizes": [sub_sizes[keeper_sub]] + [
                         sub_sizes[i] for i in range(k) if i != keeper_sub
                     ],
+                })
+                return
+            if url.path == "/session/adopt-last":
+                # Grab the most recent /identify embedding from the ring
+                # and append it to profile `name`. This is the mid-meeting
+                # /profile train path — the embedding came from the system
+                # audio stream (the call), so it actually represents the
+                # other speaker's voice rather than the user's mic.
+                qs = parse_qs(url.query)
+                name = (qs.get("name", [""])[0]).strip()
+                try:
+                    age_max = float(qs.get("age_max_s", ["20"])[0])
+                except ValueError:
+                    self._json(400, {"error": "age_max_s must be a number"})
+                    return
+                if not name:
+                    self._json(400, {"error": "need ?name=Mike"})
+                    return
+                if any(c in name for c in "/\\.."):
+                    self._json(400, {"error": "invalid name (no slashes or dots)"})
+                    return
+                now = time.time()
+                fresh = [e for e in _recent_embeddings if now - e["ts"] <= age_max]
+                if not fresh:
+                    self._json(404, {
+                        "error": (
+                            "no_recent_embeddings — no /identify within "
+                            f"{age_max:.0f}s. Is a recording in flight?"
+                        ),
+                    })
+                    return
+                latest = fresh[-1]
+                count, accepted, best_sim = _add_sample(
+                    name, latest["emb"], source="adopt-last",
+                )
+                if not accepted:
+                    self._json(200, {
+                        "ok": False,
+                        "rejected": "outlier",
+                        "name": name,
+                        "samples": count,
+                        "best_sim": round(best_sim, 3),
+                        "floor": PROFILE_OUTLIER_FLOOR,
+                    })
+                    return
+                age = now - latest["ts"]
+                print(
+                    f"adopt-last: {name} += sample "
+                    f"(age={age:.1f}s, total={count}, "
+                    f"best_sim={best_sim:.3f})",
+                    file=sys.stderr,
+                )
+                self._json(200, {
+                    "ok": True,
+                    "name": name,
+                    "samples": count,
+                    "age_s": round(age, 1),
+                    "best_sim": round(best_sim, 3),
                 })
                 return
             if url.path == "/session/clear":
@@ -1218,11 +1566,27 @@ class Handler(BaseHTTPRequestHandler):
                         return
                     auto_train_settings["min_samples"] = n
                     changed["min_samples"] = n
+                if "tightness_floor" in qs:
+                    try:
+                        t = float(qs["tightness_floor"][0])
+                    except ValueError:
+                        self._json(400, {
+                            "error": "tightness_floor must be a number",
+                        })
+                        return
+                    if not (0.0 <= t <= 1.0):
+                        self._json(400, {
+                            "error": "tightness_floor must be between 0 and 1",
+                        })
+                        return
+                    auto_train_settings["tightness_floor"] = t
+                    changed["tightness_floor"] = t
                 if not changed:
                     self._json(400, {
                         "error": (
                             "no settings provided — pass at least one of "
                             "?enabled=&floor=&margin_multiplier=&min_samples="
+                            "&tightness_floor="
                         ),
                     })
                     return

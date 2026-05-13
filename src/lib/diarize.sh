@@ -199,20 +199,78 @@ diarize_status() {
         if [[ "$compact" == *'"profiles":[]'* || -z "$body" ]]; then
             print -P "    ${C[dim]}(none — add one with /profile add <name>)${C[reset]}"
         else
-            # Have Python emit `name<TAB>count` and let zsh do the colouring
-            # via the shared C[] table — earlier we tried embedding ANSI in
-            # the Python f-string but f-strings need `\x1b`, not `\\033`,
-            # so the codes leaked through as literal `[96m` text.
+            # Have Python emit tab-separated columns and let zsh do the
+            # colouring via the shared C[] table — earlier we tried
+            # embedding ANSI in Python f-strings but f-strings need
+            # `\x1b`, not `\\033`, so the codes leaked as literal
+            # `[96m` text. Tightness/nearest are diagnostics surfaced
+            # so the user can see *why* /identify is mis-routing
+            # (e.g. Mike profile has nearest=Ethan@0.84 → cross-match).
             print -- "$body" | python3 -c '
 import json, sys
 try:
     for p in json.load(sys.stdin).get("profiles", []):
-        print("{}\t{}".format(p["name"], p["samples"]))
+        tight = p.get("tightness", 0)
+        nearest = p.get("nearest")
+        if nearest:
+            near_str = "{}@{:.2f}".format(nearest["name"], nearest["sim"])
+        else:
+            near_str = "-"
+        print("{}\t{}\t{:.2f}\t{}".format(p["name"], p["samples"], tight, near_str))
 except Exception:
     sys.exit(0)
-' | while IFS=$'\t' read -r name count; do
-                print -P "    ${C[bright_cyan]}●${C[reset]} ${C[bold]}$name${C[reset]}  ${C[dim]}($count samples)${C[reset]}"
+' | while IFS=$'\t' read -r name count tight nearest; do
+                # Colour-code the nearest cross-match score: red ≥0.80
+                # (high risk of mis-identification), yellow ≥0.65, dim
+                # otherwise. Tightness: green ≥0.85, yellow ≥0.70, red
+                # below (likely polluted profile). Use string-based
+                # comparison via Python — zsh arithmetic on float
+                # literals is brittle.
+                local near_colour="${C[dim]}" tight_colour="${C[green]}"
+                if [[ "$nearest" != "-" ]]; then
+                    local sim="${nearest##*@}"
+                    case $(python3 -c "print('hi' if $sim>=0.80 else 'mid' if $sim>=0.65 else 'lo')" 2>/dev/null) in
+                        hi)  near_colour="${C[red]}" ;;
+                        mid) near_colour="${C[yellow]}" ;;
+                    esac
+                fi
+                case $(python3 -c "print('lo' if $tight<0.70 else 'mid' if $tight<0.85 else 'hi')" 2>/dev/null) in
+                    lo)  tight_colour="${C[red]}" ;;
+                    mid) tight_colour="${C[yellow]}" ;;
+                esac
+                if [[ "$nearest" == "-" ]]; then
+                    print -P "    ${C[bright_cyan]}●${C[reset]} ${C[bold]}$name${C[reset]}  ${C[dim]}(${count} samples · tight=${tight_colour}${tight}${C[reset]}${C[dim]})${C[reset]}"
+                else
+                    print -P "    ${C[bright_cyan]}●${C[reset]} ${C[bold]}$name${C[reset]}  ${C[dim]}(${count} samples · tight=${tight_colour}${tight}${C[reset]}${C[dim]} · nearest=${near_colour}${nearest}${C[reset]}${C[dim]})${C[reset]}"
+                fi
             done
+
+            # Auto-train activity for this session, surfaced so the
+            # user sees the system is doing real work between manual
+            # /profile train calls.
+            local at_body=$(curl -s "http://127.0.0.1:$MK_DIARIZE_PORT/" 2>/dev/null)
+            local at_summary=$(print -- "$at_body" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    total = d.get("auto_train_total", 0)
+    recent = d.get("auto_train_recent_60s", 0)
+    last = d.get("auto_train_last")
+    if total == 0:
+        sys.exit(0)
+    bits = ["{} sample(s) auto-trained this session".format(total)]
+    if recent:
+        bits.append("{} in last 60s".format(recent))
+    if last:
+        bits.append("last: {} ({}s ago)".format(last["name"], last["age_s"]))
+    print(" · ".join(bits))
+except Exception:
+    sys.exit(0)
+' 2>/dev/null)
+            if [[ -n "$at_summary" ]]; then
+                print ""
+                print -P "  ${C[dim]}🎯 ${at_summary}${C[reset]}"
+            fi
         fi
     else
         # Server's down: just list filenames
@@ -497,9 +555,21 @@ diarize_auto_train() {
             fi
             print -P "${C[green]}✓${C[reset]} Auto-train min samples → ${C[bold]}${val}${C[reset]}"
             ;;
+        tight|tightness|tightness_floor|hysteresis)
+            if [[ -z "$val" ]]; then
+                print -P "${C[red]}usage:${C[reset]} /diarize auto-train tightness <0-1>"
+                return 1
+            fi
+            local resp=$(curl -s -X POST "http://127.0.0.1:$MK_DIARIZE_PORT/session/auto-train?tightness_floor=$val")
+            if ! _resp_ok "$resp"; then
+                print -P "${C[red]}error:${C[reset]} $resp"
+                return 1
+            fi
+            print -P "${C[green]}✓${C[reset]} Auto-train tightness floor → ${C[bold]}${val}${C[reset]} ${C[dim]}(profiles below this score get auto-train suspended)${C[reset]}"
+            ;;
         *)
             print -P "${C[red]}unknown:${C[reset]} ${C[dim]}/diarize auto-train $sub${C[reset]}"
-            print -P "  ${C[dim]}/diarize auto-train${C[reset]} ${C[dim]}for status, then on/off/floor/margin/min${C[reset]}"
+            print -P "  ${C[dim]}/diarize auto-train${C[reset]} ${C[dim]}for status, then on/off/floor/margin/min/tightness${C[reset]}"
             return 1
             ;;
     esac
@@ -639,25 +709,14 @@ profile_add() {
     _maybe_refresh_whitelist_from_attendees
 }
 
-profile_train() {
-    # One-sample append, for sharpening an existing profile after a misfire.
+_profile_train_via_mic() {
+    # 5s mic recording → /enroll. Used when training one's own profile,
+    # or when no recording is in flight (no system-audio embeddings to
+    # adopt). The mic IS the user's voice, so this is correct for
+    # extending the user's own profile and for the no-meeting case.
     local name="$1"
-    if [[ -z "$name" ]]; then
-        print -P "${C[red]}usage:${C[reset]} /profile train <name>"
-        return 1
-    fi
-    if ! diarize_running; then
-        print -P "${C[red]}error:${C[reset]} diarize-server not running"
-        return 1
-    fi
-
-    print -P ""
-    print -P "${C[bright_yellow]}Adding sample to ${C[bold]}$name${C[reset]}"
-    print -nP "  ${C[dim]}Press Enter to record 5s...${C[reset]}"
-    read -r _
-
+    print -P "  ${C[dim]}● recording 5s from your mic...${C[reset]}"
     local sample="/tmp/meetink-sample-$$.wav"
-    print -P "  ${C[bright_yellow]}● recording...${C[reset]}"
     if ! _profile_record_sample "$sample" 5; then
         print -P "  ${C[red]}recording failed${C[reset]}"
         rm -f "$sample"
@@ -674,20 +733,256 @@ profile_train() {
         local total=$(print -- "$resp" | sed -nE 's/.*"samples":[[:space:]]*([0-9]+).*/\1/p')
         local sim=$(print -- "$resp" | sed -nE 's/.*"best_sim":[[:space:]]*([0-9.]+).*/\1/p')
         if [[ -n "$sim" ]]; then
-            print -P "  ${C[green]}✓${C[reset]} added (total: $total samples, sim=${sim})"
+            print -P "  ${C[green]}✓${C[reset]} added (total: $total samples, sim=${sim}) ${C[dim]}[mic]${C[reset]}"
         else
-            print -P "  ${C[green]}✓${C[reset]} added (total: $total samples)"
+            print -P "  ${C[green]}✓${C[reset]} added (total: $total samples) ${C[dim]}[mic]${C[reset]}"
         fi
         _maybe_refresh_whitelist_from_attendees
+        return 0
+    fi
+
+    local rej=$(print -- "$resp" | sed -nE 's/.*"rejected":[[:space:]]*"([^"]+)".*/\1/p')
+    if [[ "$rej" == "outlier" ]]; then
+        local sim=$(print -- "$resp" | sed -nE 's/.*"best_sim":[[:space:]]*([0-9.]+).*/\1/p')
+        local floor=$(print -- "$resp" | sed -nE 's/.*"floor":[[:space:]]*([0-9.]+).*/\1/p')
+        print -P "  ${C[yellow]}⚠${C[reset]}  ${C[dim]}sample rejected as outlier (cosine ${sim} < ${floor}) — wrong speaker leaked in, or voice has changed significantly${C[reset]}"
     else
-        local rej=$(print -- "$resp" | sed -nE 's/.*"rejected":[[:space:]]*"([^"]+)".*/\1/p')
-        if [[ "$rej" == "outlier" ]]; then
-            local sim=$(print -- "$resp" | sed -nE 's/.*"best_sim":[[:space:]]*([0-9.]+).*/\1/p')
-            local floor=$(print -- "$resp" | sed -nE 's/.*"floor":[[:space:]]*([0-9.]+).*/\1/p')
-            print -P "  ${C[yellow]}⚠${C[reset]}  ${C[dim]}sample rejected as outlier (cosine ${sim} < ${floor}) — wrong speaker leaked in, or voice has changed significantly${C[reset]}"
+        print -P "  ${C[red]}server error:${C[reset]} $resp"
+    fi
+    return 1
+}
+
+profile_train() {
+    # Sharpen / extend an existing profile.
+    #
+    # Routing depends on who's being trained vs. what's currently being
+    # captured:
+    #   - Your own profile  → always use the mic. The system stream is
+    #     "everyone else", so it never carries your own voice and would
+    #     just pollute your profile.
+    #   - Someone else's    → mid-meeting, adopt the most recent system-
+    #     audio embedding from the diarize-server's ring. That's what
+    #     was just on the call. Outside a meeting, fall through to the
+    #     mic path with a warning (the user is likely about to record
+    #     room tone into a stranger's profile, but we don't hard-block).
+    local name="$1"
+    if [[ -z "$name" ]]; then
+        print -P "${C[red]}usage:${C[reset]} /profile train <name>"
+        return 1
+    fi
+    if ! diarize_running; then
+        print -P "${C[red]}error:${C[reset]} diarize-server not running"
+        return 1
+    fi
+
+    print -P ""
+    print -P "${C[bright_yellow]}Adding sample to ${C[bold]}$name${C[reset]}"
+
+    local me_name=$(me_name_get 2>/dev/null)
+    local own_profile=0
+    if [[ -n "$me_name" ]] && [[ "${name:l}" == "${me_name:l}" ]]; then
+        own_profile=1
+    fi
+
+    if (( own_profile )); then
+        print -nP "  ${C[dim]}Press Enter to record 5s...${C[reset]}"
+        read -r _
+        _profile_train_via_mic "$name"
+        return $?
+    fi
+
+    # Try adopt-last: works while a recording is in flight (the diarize-
+    # server has seen /identify calls in the last ~100 s and kept the
+    # embeddings in a small ring).
+    local resp
+    resp=$(curl -s -X POST \
+        "http://127.0.0.1:$MK_DIARIZE_PORT/session/adopt-last?name=$name&age_max_s=20")
+
+    if _resp_ok "$resp"; then
+        local total=$(print -- "$resp" | sed -nE 's/.*"samples":[[:space:]]*([0-9]+).*/\1/p')
+        local sim=$(print -- "$resp" | sed -nE 's/.*"best_sim":[[:space:]]*([0-9.]+).*/\1/p')
+        local age=$(print -- "$resp" | sed -nE 's/.*"age_s":[[:space:]]*([0-9.]+).*/\1/p')
+        if [[ -n "$sim" && -n "$age" ]]; then
+            print -P "  ${C[green]}✓${C[reset]} added (total: $total samples, sim=${sim}, ${age}s ago) ${C[dim]}[call audio]${C[reset]}"
         else
-            print -P "  ${C[red]}server error:${C[reset]} $resp"
+            print -P "  ${C[green]}✓${C[reset]} added (total: $total samples) ${C[dim]}[call audio]${C[reset]}"
         fi
+        _maybe_refresh_whitelist_from_attendees
+        return 0
+    fi
+
+    # Distinguish "no recent embeddings" (no recording) from "outlier
+    # rejected" so the user understands what happened.
+    local err=$(print -- "$resp" | sed -nE 's/.*"error":[[:space:]]*"([^"]+)".*/\1/p')
+    local rej=$(print -- "$resp" | sed -nE 's/.*"rejected":[[:space:]]*"([^"]+)".*/\1/p')
+
+    if [[ "$rej" == "outlier" ]]; then
+        local sim=$(print -- "$resp" | sed -nE 's/.*"best_sim":[[:space:]]*([0-9.]+).*/\1/p')
+        local floor=$(print -- "$resp" | sed -nE 's/.*"floor":[[:space:]]*([0-9.]+).*/\1/p')
+        print -P "  ${C[yellow]}⚠${C[reset]}  ${C[dim]}sample didn't match ${name} (cosine ${sim} < ${floor}) — was ${name} actually the last person to speak?${C[reset]}"
+        return 1
+    fi
+
+    if [[ "$err" == no_recent_embeddings* ]]; then
+        print -P "  ${C[yellow]}⚠${C[reset]}  ${C[dim]}no recent call audio — training a non-self profile via your mic would just capture YOUR voice.${C[reset]}"
+        print -P "  ${C[dim]}Start a recording, wait for ${name} to speak, then /profile train ${name}.${C[reset]}"
+        print -P "  ${C[dim]}Or use /profile assign <cluster> ${name} after a meeting.${C[reset]}"
+        return 1
+    fi
+
+    print -P "  ${C[red]}server error:${C[reset]} $resp"
+    return 1
+}
+
+profile_diagnose() {
+    # Full diagnostic dump for one profile. Useful when a person keeps
+    # getting mis-labeled — surfaces sample count, tightness, every
+    # cross-profile similarity (not just the nearest), per-centroid
+    # sample spread, and recent auto-train events targeting this name.
+    local name="$1"
+    if [[ -z "$name" ]]; then
+        print -P "${C[red]}usage:${C[reset]} /profile diagnose <name>"
+        return 1
+    fi
+    if ! diarize_running; then
+        print -P "${C[red]}error:${C[reset]} diarize-server not running"
+        return 1
+    fi
+    local resp
+    resp=$(curl -s "http://127.0.0.1:$MK_DIARIZE_PORT/profiles/$name/diagnose")
+    if ! _resp_ok "$resp"; then
+        # No "ok" key on diagnose, treat anything with "error" as failure
+        if [[ "$resp" == *'"error"'* ]]; then
+            print -P "${C[red]}error:${C[reset]} $resp"
+            return 1
+        fi
+    fi
+    print -P ""
+    # NB: we used to pass the Python script as a heredoc to `python -`,
+    # but a heredoc redirects stdin — which conflicts with the pipe
+    # delivering the JSON. The script saw zero bytes and exited silently.
+    # Workaround: put the script body in a command-substitution heredoc
+    # so it lands as the `-c` argument, leaving stdin free for the pipe.
+    local diag_script
+    diag_script=$(cat <<'PY'
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+name = d.get("name", "?")
+samples = d.get("samples", 0)
+centroids = d.get("centroids", 0)
+tight = d.get("tightness", 0.0)
+spread = d.get("samples_per_centroid", [])
+cross = d.get("cross_similarities", [])
+events = d.get("auto_train_events", [])
+wl = d.get("whitelist_member", True)
+
+def colour(v, hi=0.85, mid=0.70, invert=False):
+    if invert:
+        if v >= 0.80: return "\033[31m"
+        if v >= 0.65: return "\033[33m"
+        return "\033[90m"
+    if v >= hi:  return "\033[32m"
+    if v >= mid: return "\033[33m"
+    return "\033[31m"
+
+print(f"  \033[1m{name}\033[0m  \033[90m({samples} samples · {centroids} centroid"
+      f"{'s' if centroids != 1 else ''})\033[0m")
+print(f"    tightness:     {colour(tight)}{tight:.3f}\033[0m"
+      f"  \033[90m(1.0 = single tight cluster · ~0.85+ healthy · <0.70 likely polluted)\033[0m")
+if spread:
+    parts = [f"c{i}={n}" for i, n in enumerate(spread)]
+    print(f"    spread:        \033[90m" + " ".join(parts) + "\033[0m")
+print(f"    whitelist:     " + ("\033[36mincluded\033[0m" if wl else "\033[90mexcluded\033[0m"))
+
+if cross:
+    print()
+    print("    \033[1mCross-similarities\033[0m \033[90m(red ≥0.80 = high mis-match risk)\033[0m")
+    for c in cross[:6]:
+        s = c["sim"]
+        print(f"      {colour(s, invert=True)}{s:.3f}\033[0m  \033[90mvs\033[0m  {c['name']}")
+    if len(cross) > 6:
+        print(f"      \033[90m… {len(cross) - 6} more\033[0m")
+
+if events:
+    print()
+    print(f"    \033[1mAuto-train activity\033[0m \033[90m({len(events)} event{'s' if len(events) != 1 else ''} this session)\033[0m")
+    for e in events[-5:]:
+        bits = []
+        if e.get("confidence") is not None:
+            bits.append(f"conf={e['confidence']:.3f}")
+        if e.get("age_s") is not None:
+            bits.append(f"{e['age_s']:.0f}s ago")
+        print("      \033[90m· " + ", ".join(bits) + "\033[0m")
+
+print()
+PY
+    )
+    print -- "$resp" | "$MK_PY_VENV/bin/python" -c "$diag_script"
+}
+
+profile_rm_all() {
+    # Bulk-remove every enrolled profile. Useful after a training
+    # mistake that contaminated multiple profiles — instead of
+    # /profile rm-ing each by name, wipe the lot and start over.
+    if ! diarize_running; then
+        print -P "${C[red]}error:${C[reset]} diarize-server not running"
+        return 1
+    fi
+    local list
+    list=$(curl -s "http://127.0.0.1:$MK_DIARIZE_PORT/profiles" 2>/dev/null)
+    local count
+    count=$(print -- "$list" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print(len(d.get('profiles', [])))
+except Exception:
+    print(0)
+" 2>/dev/null)
+    if [[ -z "$count" || "$count" == "0" ]]; then
+        print -P "  ${C[dim]}No profiles to remove.${C[reset]}"
+        return 0
+    fi
+
+    print -P ""
+    print -P "  ${C[yellow]}⚠${C[reset]}  This will remove ${C[bold]}${count}${C[reset]} profile(s) permanently."
+    print -nP "  ${C[dim]}Continue? [y/N]: ${C[reset]}"
+    read -r confirm
+    if [[ "${confirm:l}" != "y" && "${confirm:l}" != "yes" ]]; then
+        print -P "  ${C[dim]}cancelled${C[reset]}"
+        return 1
+    fi
+
+    local names
+    names=$(print -- "$list" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    for p in d.get('profiles', []):
+        print(p['name'])
+except Exception:
+    pass
+" 2>/dev/null)
+
+    local removed=0 failed=0 name
+    while IFS= read -r name; do
+        [[ -z "$name" ]] && continue
+        local resp
+        resp=$(curl -s -X DELETE "http://127.0.0.1:$MK_DIARIZE_PORT/profiles/$name")
+        if _resp_ok "$resp"; then
+            (( removed++ ))
+        else
+            (( failed++ ))
+            print -P "  ${C[red]}failed:${C[reset]} $name — $resp"
+        fi
+    done <<< "$names"
+
+    print -P "${C[green]}✓${C[reset]} Removed ${C[bold]}${removed}${C[reset]} profile(s)."
+    if (( failed > 0 )); then
+        print -P "  ${C[yellow]}${failed} failed${C[reset]} — see above"
     fi
 }
 
@@ -872,10 +1167,25 @@ for tok in re.split(r"[\s.,@+\-_/]+", attendees.lower()):
     if tok:
         haystack.add(tok)
 matched = [p for p in profile_names if p.lower() in haystack]
+# Print one of:
+#   "<n1>,<n2>"  — at least one match
+#   ""           — header present but no enrolled profiles in attendees
+# Caller distinguishes the two cases. Old behaviour silently skipped on
+# empty matches, which let a stale whitelist carry over from a prior
+# meeting (e.g. last call's "Ethan, Mike" persisting into a stranger
+# call → mislabelling random voices).
 print(",".join(matched))
 PY
 )
-    [[ -z "$matched" ]] && return 0
+    if [[ -z "$matched" ]]; then
+        # Attendees header exists but no enrolled profiles match. Clear
+        # any stale whitelist so /identify returns to match-all (every
+        # voice falls through to clustering as THEM-X), rather than
+        # carrying the previous meeting's whitelist forward.
+        curl -s -X POST "http://127.0.0.1:$MK_DIARIZE_PORT/session/whitelist?clear=true" >/dev/null
+        print -P "  ${C[dim]}Whitelist cleared${C[reset]} ${C[dim]}(no enrolled profiles matched the attendees)${C[reset]}"
+        return 0
+    fi
     curl -s -X POST "http://127.0.0.1:$MK_DIARIZE_PORT/session/whitelist?profiles=$matched" >/dev/null
     local pretty=$(print -- "$matched" | sed 's/,/, /g')
     print -P "  ${C[dim]}Whitelist updated:${C[reset]} ${C[bright_cyan]}${pretty}${C[reset]}"
@@ -1051,7 +1361,15 @@ cmd_profile() {
         add|enroll|new)        profile_add     "$2"      ;;
         train|append|more)     profile_train   "$2"      ;;
         list|ls|"")            profile_list              ;;
-        rm|remove|delete)      profile_remove  "$2"      ;;
+        rm|remove|delete)
+            if [[ "$2" == "all" || "$2" == "-a" || "$2" == "--all" ]]; then
+                profile_rm_all
+            else
+                profile_remove  "$2"
+            fi
+            ;;
+        rm-all|reset-all|nuke)  profile_rm_all                ;;
+        diagnose|diag|inspect|why) profile_diagnose "$2"      ;;
         clusters|cluster)      profile_clusters          ;;
         assign)                profile_assign  "$2" "$3" ;;
         merge)                 profile_merge   "$2" "$3" ;;
@@ -1065,6 +1383,8 @@ cmd_profile() {
             print -P "  ${C[dim]}/profile train <name>${C[reset]}            add another sample"
             print -P "  ${C[dim]}/profile list${C[reset]}                    show enrolled profiles"
             print -P "  ${C[dim]}/profile rm <name>${C[reset]}               delete a profile"
+            print -P "  ${C[dim]}/profile rm all${C[reset]}                  delete every profile (asks to confirm)"
+            print -P "  ${C[dim]}/profile diagnose <name>${C[reset]}         full diagnostic dump (tightness, cross-matches, auto-train)"
             print -P "  ${C[dim]}/profile clusters${C[reset]}                show active speaker clusters"
             print -P "  ${C[dim]}/profile assign <letter> <name>${C[reset]}  cluster → profile + rewrite transcript"
             print -P "  ${C[dim]}/profile merge <from> <into>${C[reset]}     fold one cluster into another"
