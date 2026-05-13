@@ -2,6 +2,7 @@ import Foundation
 import ScreenCaptureKit
 import AVFoundation
 import CoreMedia
+import CoreAudio
 
 // MARK: - Configuration
 
@@ -969,32 +970,160 @@ struct LocalSpeechCapture {
         fputs("System audio capture started\n", stderr)
 
         // --- Microphone via AVAudioEngine ---
+        //
+        // The mic stream is fragile mid-recording: users swap headphones,
+        // toggle Bluetooth, change the system default input, or have a
+        // device silently stop delivering samples. AVAudioEngine doesn't
+        // catch all of these. We layer three redundant signal sources so
+        // a wedged tap is detected within ~5 s:
+        //
+        //   1. AVAudioEngineConfigurationChange — the documented hook.
+        //      Fires for sample-rate changes and some default-input
+        //      switches, but missing for many real-world swap patterns
+        //      (silent BT drop, manual System Settings change while the
+        //      engine is bound, Audio MIDI Setup tweaks).
+        //   2. CoreAudio HAL listener on kAudioHardwarePropertyDefault-
+        //      InputDevice. Lower-level than AVAudioEngine — fires on
+        //      EVERY system-default-input change regardless of whether
+        //      AVAudioEngine notices.
+        //   3. Heartbeat watchdog. Tracks the wall-clock time of the
+        //      most recent mic sample. If the engine claims to be
+        //      running but no samples have landed for > MIC_STALL_S,
+        //      force a rebuild. Catches "silent drop" patterns where
+        //      the device handle is technically valid but isn't
+        //      delivering audio.
+        //
+        // All three converge on the same rebuild path, serialised on a
+        // dedicated queue so a flurry of signals doesn't fire concurrent
+        // engine.stop() / installTap() calls.
         let engine = AVAudioEngine()
-        let inputNode = engine.inputNode
-        let inputFormat = inputNode.outputFormat(forBus: 0)
         let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: sampleRate, channels: 1, interleaved: false)!
-        let converter = AVAudioConverter(from: inputFormat, to: targetFormat)
 
-        inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { inBuffer, _ in
-            guard let converter = converter else { return }
+        // Shared heartbeat state. The tap closure updates the timestamp on
+        // every delivered buffer; the watchdog reads it on a 5 s tick. NSLock
+        // because both can run on arbitrary queues.
+        let micHeartbeatLock = NSLock()
+        var lastMicSampleAt: TimeInterval = Date().timeIntervalSince1970
+        let micStallThresholdSeconds: TimeInterval = 15.0
+        let updateMicHeartbeat: () -> Void = {
+            micHeartbeatLock.lock()
+            lastMicSampleAt = Date().timeIntervalSince1970
+            micHeartbeatLock.unlock()
+        }
 
-            let ratio = sampleRate / inputFormat.sampleRate
-            let outputFrameCount = AVAudioFrameCount(Double(inBuffer.frameLength) * ratio)
-            guard let outBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outputFrameCount) else { return }
-
-            let status = converter.convert(to: outBuffer, error: nil) { _, outStatus in
-                outStatus.pointee = .haveData
-                return inBuffer
+        let installMicTap: () throws -> Void = {
+            let inputNode = engine.inputNode
+            let inputFormat = inputNode.outputFormat(forBus: 0)
+            // During a device swap the engine briefly reports a zero-rate
+            // format; installing a tap on it raises. Skip and wait for the
+            // next configuration-change notification to deliver a real one.
+            guard inputFormat.sampleRate > 0 else {
+                fputs("Mic input format not ready yet, will retry on next configuration change\n", stderr)
+                return
             }
+            let converter = AVAudioConverter(from: inputFormat, to: targetFormat)
+            inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { inBuffer, _ in
+                guard let converter = converter else { return }
+                let ratio = sampleRate / inputFormat.sampleRate
+                let outputFrameCount = AVAudioFrameCount(Double(inBuffer.frameLength) * ratio)
+                guard let outBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outputFrameCount) else { return }
+                let status = converter.convert(to: outBuffer, error: nil) { _, outStatus in
+                    outStatus.pointee = .haveData
+                    return inBuffer
+                }
+                if status == .haveData, let floatData = outBuffer.floatChannelData {
+                    let samples = Array(UnsafeBufferPointer(start: floatData[0], count: Int(outBuffer.frameLength)))
+                    audioBuffer.appendMic(samples)
+                    updateMicHeartbeat()
+                }
+            }
+            try engine.start()
+            // Reset the heartbeat on install so the watchdog gives the new
+            // engine a full window to produce its first sample.
+            updateMicHeartbeat()
+        }
 
-            if status == .haveData, let floatData = outBuffer.floatChannelData {
-                let samples = Array(UnsafeBufferPointer(start: floatData[0], count: Int(outBuffer.frameLength)))
-                audioBuffer.appendMic(samples)
+        try installMicTap()
+        fputs("Microphone capture started\n", stderr)
+
+        // Serial queue: every rebuild request — whatever signal triggered
+        // it — funnels through here. Async so the calling thread (notification
+        // queue / CoreAudio HAL queue / watchdog timer) doesn't block on the
+        // tap dance.
+        let micRebuildQueue = DispatchQueue(label: "meetink.mic-rebuild")
+        let rebuildMicTap: (String) -> Void = { reason in
+            micRebuildQueue.async {
+                fputs("[\(reason)] rebuilding mic tap...\n", stderr)
+                engine.stop()
+                engine.inputNode.removeTap(onBus: 0)
+                do {
+                    try installMicTap()
+                    fputs("Mic capture resumed (trigger=\(reason))\n", stderr)
+                } catch {
+                    fputs("Failed to restart mic (trigger=\(reason)): \(error.localizedDescription)\n", stderr)
+                }
             }
         }
 
-        try engine.start()
-        fputs("Microphone capture started\n", stderr)
+        // Signal 1: AVAudioEngineConfigurationChange notification.
+        _ = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: engine,
+            queue: nil
+        ) { _ in
+            rebuildMicTap("av-engine-config-change")
+        }
+
+        // Signal 2: CoreAudio HAL listener on the system default input
+        // device. The block fires on the CoreAudio internal thread; we just
+        // dispatch into the serial rebuild queue. Bridging the property
+        // listener to a Swift closure is via AudioObjectAddPropertyListener-
+        // Block which takes an Objective-C block (Swift closures convert
+        // automatically). We keep the listener alive for the process
+        // lifetime — meetink-capture exits on /stop, taking it with us.
+        var defaultInputProp = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let halStatus = AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject),
+            &defaultInputProp,
+            DispatchQueue.global(qos: .userInitiated)
+        ) { _, _ in
+            rebuildMicTap("coreaudio-default-input-changed")
+        }
+        if halStatus != noErr {
+            fputs("Warning: CoreAudio HAL listener install failed (status=\(halStatus)); falling back to AVAudioEngine + heartbeat only\n", stderr)
+        }
+
+        // Signal 3: heartbeat watchdog. Polls every 5 s. If the engine
+        // reports running but no mic samples have landed in the last
+        // micStallThresholdSeconds, force a rebuild. Catches silent-drop
+        // patterns (BT disconnect that doesn't trigger either of the
+        // notifications above).
+        let micWatchdogTimer = DispatchSource.makeTimerSource(queue: micRebuildQueue)
+        micWatchdogTimer.schedule(deadline: .now() + 5.0, repeating: 5.0, leeway: .seconds(1))
+        micWatchdogTimer.setEventHandler {
+            guard engine.isRunning else { return }
+            let now = Date().timeIntervalSince1970
+            micHeartbeatLock.lock()
+            let elapsed = now - lastMicSampleAt
+            micHeartbeatLock.unlock()
+            if elapsed > micStallThresholdSeconds {
+                fputs("Mic stall detected: \(String(format: "%.1f", elapsed))s since last sample (threshold=\(Int(micStallThresholdSeconds))s)\n", stderr)
+                // Direct call here is safe — we're already on the rebuild queue.
+                engine.stop()
+                engine.inputNode.removeTap(onBus: 0)
+                do {
+                    try installMicTap()
+                    fputs("Mic capture resumed (trigger=heartbeat-stall)\n", stderr)
+                } catch {
+                    fputs("Failed to restart mic after heartbeat stall: \(error.localizedDescription)\n", stderr)
+                }
+            }
+        }
+        micWatchdogTimer.resume()
 
         fputs("\n=== Meeting capture running ===\n", stderr)
         fputs("Transcript: \(transcriptPath)\n", stderr)
@@ -1039,8 +1168,9 @@ struct LocalSpeechCapture {
         }
 
         // --- Shutdown ---
+        micWatchdogTimer.cancel()
         engine.stop()
-        inputNode.removeTap(onBus: 0)
+        engine.inputNode.removeTap(onBus: 0)
         try await stream.stopCapture()
 
         // Flush any buffered merged transcript lines

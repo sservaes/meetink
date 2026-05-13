@@ -410,18 +410,40 @@ func cameraInUseElsewhere() -> Bool {
     return false
 }
 
-// Browser window title scan via AppleScript. Catches Google Meet,
-// Whereby, Around, Jitsi etc. in Chrome / Safari / Arc / Brave / Edge.
-// Tolerant: returns nil if no browser is running or Automation
-// permission was denied.
-let kBrowserMeetingPatterns: [(label: String, needles: [String])] = [
-    ("meet",   ["meet.google.com", "google meet"]),
-    ("webex",  ["webex.com"]),
-    ("teams",  ["teams.microsoft.com", "teams.live.com"]),
-    ("zoom",   ["zoom.us/j/", "zoom.us/wc/"]),
-    ("whereby",["whereby.com"]),
-    ("jitsi",  ["meet.jit.si"]),
-    ("around", ["around.co"]),
+// Browser tab URL scan via AppleScript. Catches Google Meet, Whereby,
+// Around, Jitsi etc. in Chrome / Safari / Arc / Brave / Edge. Tolerant:
+// returns nil if no browser is running or Automation permission was denied.
+//
+// Patterns are evaluated as regexes (case-insensitive after the lower-cased
+// input). Anchoring the meeting-room URL — rather than matching the bare
+// host — is how we flip "active = false" the moment the user presses End:
+// Meet, Zoom, Teams, etc. redirect away from the room URL into a landing
+// page within ~1 s of leaving, so a tight regex catches the transition
+// the very next poll without waiting on `meet.google.com` matching a
+// stale landing-page tab.
+let kBrowserMeetingPatterns: [(label: String, patterns: [String])] = [
+    // Meet room codes are 3-4-3 lowercase letters (e.g. abc-defg-hij).
+    // Lookup URLs (meet.google.com/lookup/...) also indicate an active
+    // join in progress. The /_meet/ prefix shows up after Workspace
+    // cohort redirects — same room code, just routed through a
+    // privacy-namespace path. Bare meet.google.com (landing) is excluded.
+    ("meet",   ["meet\\.google\\.com/[a-z]{3,4}-[a-z]{3,5}-[a-z]{3,4}",
+                "meet\\.google\\.com/_meet/[a-z]{3,4}-[a-z]{3,5}-[a-z]{3,4}",
+                "meet\\.google\\.com/lookup/"]),
+    ("zoom",   ["zoom\\.us/j/[0-9]", "zoom\\.us/wc/[0-9]"]),
+    // Teams meeting URLs go through /l/meetup-join/ or /_#/conv/.
+    ("teams",  ["teams\\.microsoft\\.com/l/meetup-join/",
+                "teams\\.microsoft\\.com/_#/conv/",
+                "teams\\.live\\.com/meet/"]),
+    // Webex's join URL uses /meet/ for personal rooms, /j.php?MTID= for
+    // scheduled meetings, /wbxmjs/ for the web app session.
+    ("webex",  ["webex\\.com/meet/",
+                "webex\\.com/j\\.php\\?",
+                "webex\\.com/wbxmjs/"]),
+    // Whereby rooms always have a path after the host.
+    ("whereby",["whereby\\.com/[a-z0-9]"]),
+    ("jitsi",  ["meet\\.jit\\.si/[a-z0-9]"]),
+    ("around", ["around\\.co/r/", "around\\.co/meet/"]),
 ]
 
 func browserMeetingActive() -> String? {
@@ -457,9 +479,11 @@ func browserMeetingActive() -> String? {
     let result = scriptObj.executeAndReturnError(&error)
     if error != nil { return nil }
     guard let s = result.stringValue?.lowercased() else { return nil }
-    for (label, needles) in kBrowserMeetingPatterns {
-        for n in needles {
-            if s.contains(n) { return label }
+    for (label, patterns) in kBrowserMeetingPatterns {
+        for p in patterns {
+            if s.range(of: p, options: .regularExpression) != nil {
+                return label
+            }
         }
     }
     return nil

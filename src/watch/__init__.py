@@ -7,7 +7,8 @@ response to event boundaries + meeting-active signals.
 
 Two recording paths:
   - Scheduled: a calendar event approaches → 1-min warning → record at
-    start time → end when conferencing app stays absent for 2 min.
+    start time → end ~10 s after the conferencing app goes away (fast
+    confirm: switches to 5 s polling on the first inactive read).
   - Instant:   meeting-active flips true outside any scheduled window,
     stable for one 30 s poll → confirmation notification (Skip option,
     default = record after 60 s) → recording for the same end criteria.
@@ -72,11 +73,19 @@ NOTIFY_LEAD_S = 60.0          # 1-min-before notification
 NOTIFY_TIMEOUT_S = 60         # how long to wait for a Skip click
 EXPIRE_AFTER_END_S = 600      # 10 min past end with no record = expired
 
-# Number of consecutive meeting-active=false polls required to declare
-# the current call ended. With ACTIVE_POLL_S=30 s, 4 ticks = 2 min of
-# the conferencing app being absent. Avoids brief Zoom hiccups stopping
-# a real recording, while still catching post-meeting cleanup quickly.
-MEETING_END_QUIET_TICKS = 4
+# Fast-confirm cadence. The instant we see one "inactive" poll while a
+# recording is in flight, we drop the polling interval from ACTIVE_POLL_S
+# to FAST_END_POLL_S and only require MEETING_END_QUIET_TICKS consecutive
+# inactives to fire /stop. End-of-meeting detection becomes 10-15 s
+# instead of 2 min — close to Granola's "press End → recording stops"
+# feeling — without burning CPU on fast polling for the whole call.
+#
+# Tightened browser URL regexes (in MeetinkAgent) make false-positive
+# inactive blips much rarer: Meet/Zoom/Teams all redirect away from
+# their room-code URLs the instant the user presses End, so the first
+# inactive poll after End is almost always real.
+FAST_END_POLL_S = 5.0
+MEETING_END_QUIET_TICKS = 2
 
 # Instant-meeting detection.
 #   CONFIRM_TICKS    — consecutive active polls before fire. 1 = 30 s of
@@ -474,11 +483,23 @@ class WatchManager:
                 if 0 < lead <= NOTIFY_LEAD_S:
                     self._fire_notification(e)
 
-        # Single meeting-active poll per ACTIVE_POLL_S window. Result
-        # cached on the manager; both end-detection (currently recording)
-        # and instant-detection (idle) consume it. Maintains the
+        # Single meeting-active poll per polling window. Cadence adapts:
+        #   - Steady state: ACTIVE_POLL_S (30 s) — keeps CPU/battery cost
+        #     low while no transition is being decided.
+        #   - End confirmation: FAST_END_POLL_S (5 s) — kicks in as soon
+        #     as we see a single inactive poll while recording, so we can
+        #     fire /stop within ~10 s of the user pressing End instead of
+        #     waiting another full 30 s for the next slow poll.
+        # Result is cached on the manager; both end-detection (currently
+        # recording) and instant-detection (idle) consume it. Maintains
         # _inactive_streak / _instant_streak counters in lockstep.
-        if now_wall - self._last_active_poll > ACTIVE_POLL_S:
+        with self._lock:
+            in_fast_confirm = (
+                self._currently_recording is not None
+                and self._inactive_streak >= 1
+            )
+        poll_interval = FAST_END_POLL_S if in_fast_confirm else ACTIVE_POLL_S
+        if now_wall - self._last_active_poll > poll_interval:
             self._poll_meeting_active()
 
         # Recording start/stop based on event boundaries + meeting-active.
@@ -724,7 +745,8 @@ class WatchManager:
 
         Process detection > silence detection — brainstorm gaps don't
         false-positive (we end only when the conferencing app has been
-        absent for MEETING_END_QUIET_TICKS consecutive 30 s polls)."""
+        absent for MEETING_END_QUIET_TICKS consecutive polls; cadence
+        drops to FAST_END_POLL_S once we've seen the first inactive)."""
         with self._lock:
             if self._inactive_streak < MEETING_END_QUIET_TICKS:
                 return
