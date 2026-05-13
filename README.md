@@ -60,9 +60,10 @@ If you take a lot of meetings on your Mac and want a private transcript, you usu
 - **Live, labelled transcripts.** Two streams (mic / system audio), aggressively de-hallucinated, merged into readable lines, written to a per-session file.
 - **AI titles and summaries.** Finished meetings are renamed `2026-05-07_14-32_design-review-followup.txt`, and a `<name>.summary.md` (Topics, Decisions, Action items, Open questions) is generated automatically. Backend is `local` (on-device Qwen3.5-4bit via MLX) or `claude` (your Claude Pro/Max subscription via the `claude` CLI).
 - **`/ask` over the meeting.** Stream answers about the current or most-recent transcript, with project context and prior `/ask` turns automatically threaded in.
-- **Auto-record from your calendar.** `/watch on` polls Calendar.app, fires a 1-minute notification before each event with a Skip button, then auto-starts recording at the scheduled time — and auto-stops when the conferencing app (Zoom / Meet / Teams / Webex) goes quiet for 2 min. Catches impromptu calls too: a meeting that starts without a calendar event triggers a confirmation notification ~30 s in. State persists across REPL restarts.
-- **Speaker identification, tunable per meeting.** Optional sidecar (sherpa-onnx + WeSpeaker) labels recurring voices by name once you've enrolled a `/profile`. Unknown voices get clustered live as `THEM-A`, `THEM-B`, … Three sensitivity presets (`focused` / `default` / `strict`) auto-applied from the calendar event's attendee count, plus a per-session **whitelist** that restricts matching to people who are actually in the room — so Mike's voice can never be misidentified as Alice in a 1:1 with Mike.
-- **Self-improving profiles, that keep getting better.** Three mechanisms compound: (1) high-confidence `/identify` matches fold back into the matched profile (auto-train, off-by-default-able); (2) each profile holds up to 3 k-means centroids so a person's *different voice modes* (different mic, mood, accent variation) all match their best mode instead of being averaged together; (3) time decay (180-day half-life) keeps the centroid tracking the speaker's current voice, not their voice from a year ago. Outlier rejection guards every sample-add path (`/enroll`, `/train`, `/assign`, `/rename`, auto-train) so one bad sample can't pollute a centroid. Recoverable per-sample via `/profile undo`.
+- **Auto-record from your calendar.** `/watch on` polls Calendar.app, fires a 1-minute notification before each event with a Skip button, then auto-starts recording at the scheduled time — and auto-stops within **~10 s** of the conferencing app going away (tightened browser URL regex + fast-confirm polling: the moment we see one inactive poll mid-recording the cadence drops from 30 s to 5 s and stop fires after one more). Catches impromptu calls too: a meeting that starts without a calendar event triggers a confirmation notification ~30 s in. State persists across REPL restarts.
+- **Speaker identification, tunable per meeting.** Optional sidecar (sherpa-onnx + WeSpeaker) labels recurring voices by name once you've enrolled a `/profile`. Unknown voices get clustered live as `THEM-A`, `THEM-B`, … Three sensitivity presets (`focused` / `default` / `strict`) auto-applied from the calendar event's attendee count, plus a per-session **whitelist** that restricts matching to people who are actually in the room — so Mike's voice can never be misidentified as Alice in a 1:1 with Mike. When the whitelist narrows to one profile, a higher absolute floor kicks in to prevent the "the only candidate wins by default" failure mode.
+- **Self-improving profiles, that keep getting better.** Four mechanisms compound: (1) high-confidence `/identify` matches fold back into the matched profile (auto-train, with a tightness-hysteresis pause that suspends auto-train on any profile whose samples have started spreading — catches runaway drift before it snowballs); (2) `/profile train <name>` mid-meeting adopts the most recent system-audio embedding from the call rather than re-recording your mic, so you can click "train Mike" right after Mike speaks and actually grab *his* voice; (3) each profile holds up to 3 k-means centroids so a person's *different voice modes* (different mic, mood, accent variation) all match their best mode instead of being averaged together; (4) time decay (180-day half-life) keeps the centroid tracking the speaker's current voice, not their voice from a year ago. Outlier rejection guards every sample-add path (`/enroll`, `/train`, `/assign`, `/rename`, auto-train) so one bad sample can't pollute a centroid. Recoverable per-sample via `/profile undo`; full diagnostic via `/profile diagnose <name>`.
+- **Hot-swap mics mid-call.** Unplug your headphones, switch Bluetooth, pick a new mic in System Settings — the capture binary subscribes to `AVAudioEngineConfigurationChange` and rebuilds the tap on the new device without losing the recording. No more "I switched mics and my voice disappeared from the transcript."
 - **Projects.** Group recordings, summaries, and reference docs by client / topic. `/ask` automatically pulls in past meetings and curated context for the active project.
 - **Context documents.** `/context add report.pdf` converts any PDF / DOCX / XLSX / PPTX / MD into the project's reference set so the LLM can read it.
 - **Native terminal UX.** `prompt_toolkit` REPL with tab completion, native scrollback, native text selection, native ⌘F. Live status footer with elapsed recording time and line count.
@@ -179,9 +180,21 @@ Run `meetink` with no arguments at a TTY to drop into the REPL:
 └──────────────────────────────────────────────────────────────────────┘
 
 > _
-🎙 qwen3.5-2b │ 📁 acme-corp │ 👤 STIJN │ ✨ local titling │ 🧠 32GB · 14.3GB free
+🎙 small.en │ 📁 acme-corp │ 📦 acme-corp │ 👤 3 profiles · default │ 👁 watch on │ 🎯 +5 auto · Alice │ ✨ Sonnet │ 📚 ready │ 🧠 32GB · 14.3GB free
 ● recording 02:14 │ 24 lines │ context ▰▰▰▰▰▱▱▱ 62% 16K
 ```
+
+The footer chips:
+
+- `🎙` active whisper model
+- `📁` transcripts folder (project-aware)
+- `📦` active project
+- `👤` diarize state + profile count + active sensitivity preset (`focused` / `default` / `strict`)
+- `👁` `/watch` on/off (cyan when on)
+- `🎯` auto-train activity this session — `+N auto · Name` shows total count and the most recent profile that got an auto-trained sample (cyan when there was a hit in the last 60 s, grey when stale); chip is hidden until at least one auto-train has fired
+- `✨` titling backend (`Sonnet` / `Opus` / `qwen3.5-2b` / …)
+- `📚` RAG index state for `/ask` over long meetings
+- `🧠` total / free RAM
 
 - **Tab completion** — start typing `/` and hit Tab. Fuzzy completion on subcommands and (where it makes sense) on names: profile names, project names, attached context docs.
 - **Native scroll & selection** — wheel scroll, click-and-drag select, ⌘C, ⌘F all work because the REPL runs *inline* (not in alt-screen mode). The footer scrolls with content; scroll back to the prompt to see the live status.
@@ -222,10 +235,11 @@ Long-running watcher that polls Calendar.app, schedules notifications, and drive
 
 When `/watch` auto-records:
 - **Sensitivity** is auto-set from the event's attendee count: 1–2 → `focused`, 3–5 → `default`, 6+ → `strict`.
-- **Whitelist** is auto-derived: profile names matching any name/email token in the attendee list are kept, others are filtered out for this meeting.
+- **Whitelist** is auto-derived: profile names matching any name/email token in the attendee list are kept, others are filtered out for this meeting. If no enrolled profile matches the attendee list, the whitelist is **cleared** (rather than carrying the previous meeting's whitelist forward), so unfamiliar voices fall cleanly to clustering.
 - **Project routing** sends the recording to a matching project subdirectory if the event's title clearly references one (LLM-verified, defaults to no project on doubt).
 - **No tail window** is opened (you're in the meeting, not at the desk).
 - **Instant meetings** — calls that start without a calendar event — fire a confirmation notification (Skip / 60 s default-record) once the conferencing app has been active for one stable poll. Skipping installs a 30-min cooldown for that source.
+- **Fast end detection** — auto-stop fires within **~10 s** of you pressing End in the conferencing app. The browser URL match requires a room-code path (`meet.google.com/abc-defg-hij`, `zoom.us/j/<digits>`, `teams.microsoft.com/l/meetup-join/`, …), so the post-call landing page no longer counts as active; and the polling cadence drops from 30 s to 5 s the moment we see one inactive read while recording.
 
 ### Identity
 
@@ -264,6 +278,7 @@ When `/watch` auto-records:
 | `/diarize auto-train floor <0.0–1.0>` | Set the confidence floor a match must clear to qualify (default 0.88). |
 | `/diarize auto-train margin <multiplier>` | Set the margin multiplier — top match must beat runner-up by ≥ N × the active MARGIN (default 2.0). |
 | `/diarize auto-train min <count>` | Min profile samples required before auto-train fires for that profile (default 5). |
+| `/diarize auto-train tightness <0–1>` | Suspend auto-train for any profile whose tightness drops below this (default 0.75). Catches runaway drift — once a non-target voice gets confidently auto-trained in, subsequent matches skew, more wrong samples land, and the centroid keeps drifting. The hysteresis pause gives you a window to fix it (re-train, `/profile pop`, `/profile rm`-then-re-add) before it snowballs. |
 
 **Sensitivity presets** trade off how aggressive matching is:
 
@@ -279,14 +294,18 @@ When `/watch` auto-records:
 
 | Command | Description |
 |---|---|
-| `/profile` / `/profile list` | Show enrolled people. |
-| `/profile add <name>` | Record 3 × 5-second voice samples and persist a centroid as `<name>.npz`. The diarize-server must be running. |
-| `/profile train <name>` | Record one more 5-second sample and append it. Sharpens the centroid. |
+| `/profile` / `/profile list` | Show enrolled people with sample counts, **tightness** (how concentrated each profile is — green ≥0.85, yellow ≥0.70, red below), and **nearest** other profile + cosine (red ≥0.80 = high cross-match risk). Plus a one-line summary of this session's auto-train activity. |
+| `/profile add <name>` | Record 3 × 5-second voice samples from your mic and persist a centroid as `<name>.npz`. Use this for enrolling yourself or anyone present in the room. The diarize-server must be running. |
+| `/profile train <name>` | Add one more sample. **Routing depends on context:** for *your own* name (matches `/me`), records 5 s from your mic. For *someone else mid-meeting*, grabs the most recent system-audio embedding from the diarize-server's ring buffer — so clicking train right after they speak captures *their* voice from the call, not your mic. For someone else with no recording running, errors out with a clear explanation (training others via your mic doesn't make sense). Output tags the path (`[mic]` or `[call audio]`) so you can tell which fired. |
 | `/profile undo <name> [count]` | Pop the last N samples (default 1) off a profile. Recovery for `/profile train` calls that picked up a stray voice, or auto-train additions you don't trust. Refuses to empty a profile (use `/profile rm` for that). |
+| `/profile diagnose <name>` | Full diagnostic dump for one profile: sample count, centroid count, per-centroid sample spread, tightness, every cross-profile similarity (sorted descending — top entries are your cross-match risks), and recent auto-train events targeting this name. Use when someone keeps getting mis-labeled. |
 | `/profile rm <name>` | Delete a profile. |
-| `/profile rename <old> <new>` | Rename a profile. If `<new>` already exists, **folds** `<old>`'s samples into it (use case: two enrollments turn out to be the same person). Rewrites uppercase labels in the live transcript. |
+| `/profile rm all` | Delete *every* profile (with confirmation). Use after a training mistake polluted multiple profiles and you want a clean slate. Also accepts `/profile rm-all` and `/profile nuke`. |
+| `/profile rename <old> <new>` | Rename a profile. If `<new>` already exists, **folds** `<old>`'s samples into it (use case: two enrollments turn out to be the same person). Rewrites uppercase labels in the live transcript. Outlier filter drops samples that don't actually match the destination. |
 | `/profile clusters` | Show the live "unknown" voice clusters (`THEM-A`, `THEM-B`, …) the current session has accumulated. |
-| `/profile assign <letter> <name>` | Convert a live cluster into a real profile **and** rewrite past lines in the current transcript: `THEM-A` → `ALICE`. Re-assigning into an existing name vstacks samples (so cluster intelligence is preserved). |
+| `/profile assign <letter> <name>` | Convert a live cluster into a real profile **and** rewrite past lines in the current transcript: `THEM-A` → `ALICE`. Re-assigning into an existing name vstacks samples (so cluster intelligence is preserved). Outlier filter drops cluster samples that don't fit the target. |
+| `/profile clear <letter>` | Drop one in-memory cluster (e.g. `THEM-A`) — future utterances re-cluster as a fresh letter. Use when a cluster has accumulated two distinct voices and you want them split. |
+| `/profile split <letter> [k]` | k-means split one cluster into k sub-clusters (default 2). Largest sub keeps the original letter; the rest get fresh letters. Inspect the result with `/profile clusters` then assign each sub to the right person. |
 | `/profile merge <from> <into>` | Fold one cluster into another. Useful when one voice gets split across two clusters by background noise. |
 
 When `/profile add`, `/profile train`, `/profile assign`, or `/profile rename` succeeds during a live `/watch`-driven recording, the per-session whitelist is automatically re-derived from the event's `# attendees:` header — so a person enrolled mid-call immediately tightens the matching set without a manual `/diarize whitelist`.
@@ -406,20 +425,33 @@ By default, system-audio lines are labelled `THEM:`. With `/diarize on` and a pr
 
 Per-chunk diarization: each ~3 s WAV chunk is identified individually (synchronous, ~300 ms via the local sidecar) before the line is written, so the labels you see live are the same labels in the final file.
 
-Five controls let you tune accuracy. Three are session-level:
+Controls fall into three layers: **session-level** knobs you reach for from the REPL, **profile representation** invariants that keep matching accurate as samples accumulate, and **safety guards** that fire on every sample addition.
+
+**Session-level (REPL):**
 
 - **Sensitivity preset** (`/diarize sensitivity focused|default|strict`) shifts THRESHOLD / MARGIN / CLUSTER_THRESHOLD as a coherent set. `/watch` picks one automatically based on attendee count.
-- **Per-session whitelist** (`/diarize whitelist alex stacey` or `/start alex stacey`) restricts `/identify` to a subset — the surgical fix for cross-meeting false-matches when a similar-sounding stranger is in the room.
-- **Auto-train** (`/diarize auto-train`, on by default) folds high-confidence matches back into the matched profile so it sharpens over time. Conservative guardrails (floor 0.88, 2× margin, min-samples 5) prevent the classic pollution failure mode; `/profile undo <name>` peels off any add you don't trust.
+- **Per-session whitelist** (`/diarize whitelist alex stacey` or `/start alex stacey`) restricts `/identify` to a subset — the surgical fix for cross-meeting false-matches when a similar-sounding stranger is in the room. `/watch` auto-derives this from the calendar event's attendees; if no enrolled profile matches the attendees, the whitelist is **cleared** rather than carrying forward.
+- **Single-profile floor.** When the whitelist shrinks to exactly one profile, the standard MARGIN check is meaningless (no runner-up to compare against — `top − (−1.0)` is always huge). A higher absolute floor (`MEETINK_DIARIZE_SINGLE_FLOOR`, default 0.78) takes over instead, so a vaguely-similar voice doesn't get confidently labeled as the only candidate. Catches the "Mike-as-Ethan in a 1:1" failure mode.
+- **Close-pair adaptive margin.** When the top profile and runner-up cross-match heavily (centroid-vs-centroid cosine ≥ `MEETINK_DIARIZE_CLOSE_PAIR_THRESHOLD`, default 0.80 — common with similar voices the WeSpeaker model can't separate by much), the standard MARGIN becomes unsatisfiable: even a person speaking on their own profile scores within ~0.05 of the close-pair partner. Drop to a smaller `MEETINK_DIARIZE_CLOSE_PAIR_MARGIN` (default 0.03) in that case. The intuition: the consistent direction of advantage IS the signal — when the model lumps Alex and Ethan in the same neighbourhood, a 0.05 gap that systematically favours Alex when Alex speaks (and the reverse for Ethan) is what we can trust. THRESHOLD still protects against absolute-low scores from strangers. Auto-train continues to use the standard (large) MARGIN, so close-pair acceptances never fold into the centroids on their own — the only way to keep them is via manual `/profile train`.
+- **Auto-train** (`/diarize auto-train`, on by default) folds high-confidence matches back into the matched profile so it sharpens over time. Conservative guardrails: floor 0.88, 2× margin, min-samples 5, and a **tightness hysteresis** (`auto-train tightness`, default 0.75) that suspends auto-train for any profile whose samples start spreading — preventing the runaway-drift failure where one wrong auto-add skews the centroid, which lets more wrong samples land, which skews further. `/profile undo <name>` peels off any add you don't trust.
 
-Two are baked into the profile representation itself, so accuracy keeps improving as samples accumulate instead of plateauing:
+**Profile representation** — baked into how each `.npz` is built, so accuracy keeps improving as samples accumulate instead of plateauing:
 
 - **Multi-centroid k-means.** Each profile holds up to `PROFILE_MAX_CENTROIDS` (default 3) cluster centroids, re-derived on every mutation. `/identify` scores against the **best-matching** centroid, not the mean across all of them. Catches multimodal voices — same person on a headset vs laptop mic, calm work voice vs excited brainstorm voice — without averaging the modes into the middle of voice space where neither fits. K grows with sample count: 1 centroid until 10 samples, 2 by 20, 3 by 30 (capped).
 - **Time decay.** Centroid recomputation weights samples by `exp(-age / TAU)` (default TAU = 180 days). Recent samples dominate; old samples still contribute (1/e ≈ 37% weight at TAU). Profile tracks the speaker's current voice — new headset, recovered from a cold, different room acoustics — without losing the long-tail history. Set `MEETINK_PROFILE_TIME_DECAY_TAU_S=0` to disable.
 
-And one safety guard runs on **every** sample addition (`/enroll`, `/profile train`, `/profile assign`, `/profile rename`, auto-train):
+**Safety guards** run on every sample addition (`/enroll`, `/profile train`, `/profile assign`, `/profile rename`, auto-train):
 
-- **Outlier rejection.** A new sample's cosine against the profile's nearest existing centroid must clear `PROFILE_OUTLIER_FLOOR` (default 0.40, calibrated for 256-D WeSpeaker embeddings where same-speaker similarity ≥ 0.5 and distinct-speaker similarity < 0.4). Catches a different voice bleeding into a `/profile train` recording, or a `/profile rename` fold where the two profiles turn out to be different people (the original FLAVIO/BOB pollution failure). Rejected samples are surfaced in the response so you see "6 of 13 samples dropped as outliers" and know your assumption about cluster identity was wrong.
+- **Outlier rejection.** A new sample's cosine against the profile's nearest existing centroid must clear `PROFILE_OUTLIER_FLOOR` (default 0.40, calibrated for 256-D WeSpeaker embeddings where same-speaker similarity ≥ 0.5 and distinct-speaker similarity < 0.4). Catches a different voice bleeding into a `/profile train` recording, or a `/profile rename` fold where the two profiles turn out to be different people. Rejected samples are surfaced in the response so you see "6 of 13 samples dropped as outliers" and know your assumption about cluster identity was wrong.
+- **Identify-side rejection logging.** When `/identify` falls below threshold / margin / single-floor, the diarize-server stderr-logs the gate that failed and the score gap (`identify reject: Ethan@0.61 vs Mike@0.55 gap=0.06 < margin=0.07`). Tail `/tmp/meetink-diarize.log` (or `/diarize log`) when an enrolled person is silently labeled `THEM-X` and you want to know why.
+
+**Mid-meeting `/profile train` adopts the call audio.** Pre-v0.1.1, training another person mid-call recorded from your mic — which captured silence (you're listening) and added noise to that person's profile. Now: the diarize-server keeps a 10-entry ring of recent `/identify` embeddings (the call audio); `/profile train Mike` POSTs to `/session/adopt-last` which folds the most-recent embedding into Mike's profile. The CLI auto-routes: your own name → mic; others → call-audio ring (or a helpful error when there's no recording in flight).
+
+**Diagnostic helpers:**
+
+- `/profile list` shows tightness and nearest-other-profile per row, so cross-match risk is visible at a glance.
+- `/profile diagnose <name>` is the deep dive: per-centroid sample spread, every cross-similarity (not just nearest), and recent auto-train events targeting this name.
+- `🎯 +N auto · Name` chip in the REPL footer confirms auto-train is doing work between manual trains.
 
 ### `/watch` — auto-record from your calendar
 
@@ -428,8 +460,12 @@ And one safety guard runs on **every** sample addition (`/enroll`, `/profile tra
 - Polls Calendar.app every 60 s via a Swift sidecar (`MeetinkAgent.app`, EventKit + UserNotifications). 1-min-before notifications fire with a Skip button.
 - Auto-routes each event to a matching project (LLM-verified — only when the event's title clearly references one of your existing project names).
 - Auto-applies a sensitivity preset and a profile whitelist derived from the attendee list, before `/start` fires.
-- Polls for an active conferencing app (camera in use, Zoom/Teams/Webex/GoogleMeet processes, browser tabs on `meet.google.com` / `webex.com` / `teams.microsoft.com` / `zoom.us` / `whereby.com` / `meet.jit.si` / `around.co`) every 30 s. When a call starts without a calendar event and stays active for one stable poll, fires a "Detected `<source>` call. Recording in 60 s — Skip to ignore" notification.
-- Auto-stops the recording when the conferencing app has been absent for 4 consecutive 30 s polls (≈ 2 min).
+- Polls for an active conferencing app every 30 s via three signals:
+  - **Process names** — `CptHost` / `zoom.us` (Zoom), `MSTeams` (Teams), `Webex` / `WebexHelper` (Webex), `GoogleMeet` (Meet PWA).
+  - **Camera-in-use** — strongest "video call active" signal, falls cleanly when the user has video off the whole call.
+  - **Browser tab URLs (regex-matched)** — tabs are required to look like an actual meeting URL, not just the bare host. Meet needs an `xxx-yyyy-zzz` room code path (or `/_meet/<code>` / `/lookup/`), Zoom needs `/j/<digits>` or `/wc/<digits>`, Teams needs `/l/meetup-join/` or `/_#/conv/`, Webex needs `/meet/` / `/j.php?` / `/wbxmjs/`, Whereby / Jitsi / Around need a path after the host. The post-call landing pages no longer count as active, so pressing End in the conferencing app flips the signal almost immediately.
+- When a call starts without a calendar event and stays active for one stable poll, fires a "Detected `<source>` call. Recording in 60 s — Skip to ignore" notification.
+- **Fast end detection.** Auto-stops the recording within ~10 s of the conferencing app going away. Cadence is adaptive: 30 s steady-state, but the moment we see one inactive poll while recording, polling drops to 5 s and `/stop` fires after one more inactive read. Typical end-to-stop is 10–15 s; worst case 35 s.
 - State persists across REPL restarts via `watch_enabled` in `~/.meetink/config`.
 
 The auto-recording path is intentionally **not** identical to manual `/start` — it suppresses the auto-tail window (you're in the meeting, not at the desk), it sets `MEETINK_EVENT_*` env vars that `meetink-capture` writes into the transcript header (event, attendees, location, RSVP, calendar source, project, instant flag, detected-source), and it routes through `MEETINK_WHITELIST` for the per-session profile restriction.
@@ -538,7 +574,7 @@ The follow-up sees the prior turn — `MLXRuntime.add_ask_pair` records each com
 
 ### Letting `/watch` handle a day of meetings
 
-Turn the watcher on once. It survives REPL restarts (config flag), polls Calendar.app every 60 s, fires a 1-min-before notification with a Skip button for each event, auto-starts recording at the scheduled time, and auto-stops 2 min after the conferencing app goes quiet.
+Turn the watcher on once. It survives REPL restarts (config flag), polls Calendar.app every 60 s, fires a 1-min-before notification with a Skip button for each event, auto-starts recording at the scheduled time, and auto-stops within ~10 s of the conferencing app going quiet (fast-confirm cadence kicks in on the first inactive poll).
 
 ```
 > /watch on
@@ -563,7 +599,7 @@ Turn the watcher on once. It survives REPL restarts (config flag), polls Calenda
 # When an unscheduled call starts (someone Slack-calls):
 # Notification: "meetink — instant meeting · Detected zoom call. Recording in 60 s — Skip to ignore."
 # Stijn either clicks Skip or lets the timer run; recording auto-starts and runs
-# until the call ends (Zoom process gone for 2+ min).
+# until the call ends (Zoom process gone for ~10 s in fast-confirm mode).
 
 > /watch off       # end of day
 ✓  /watch off
@@ -596,6 +632,30 @@ Turn the watcher on once. It survives REPL restarts (config flag), polls Calenda
 > /profile assign B Bob
 > /profile merge C B        # C was Bob with background noise
 ```
+
+### Diagnosing why someone keeps getting mis-labeled
+
+```
+> /profile diagnose Mike
+
+  Mike  (41 samples · 3 centroids)
+    tightness:     0.91   (1.0 = single tight cluster · ~0.85+ healthy · <0.70 likely polluted)
+    spread:        c0=18 c1=15 c2=8
+    whitelist:     included
+
+    Cross-similarities  (red ≥0.80 = high mis-match risk)
+      0.84   vs   Florin    ← high
+      0.78   vs   Ethan     ← moderate
+      0.72   vs   Stacey
+      0.68   vs   Grant
+
+    Auto-train activity  (3 events this session)
+      · conf=0.913, 42s ago
+      · conf=0.901, 1m20s ago
+      · conf=0.894, 3m04s ago
+```
+
+The 0.84 cross-match against Florin means when both are whitelisted, the standard MARGIN gate (0.07) won't reliably separate them — the gap can shrink to 0.05 on a noisy window. Either bump margin (`/diarize sensitivity focused` → 0.12), train more samples to push the centroids apart, or use `/profile assign` after the meeting to clean up mis-labels.
 
 ### Tail in a separate window while you work
 
@@ -756,11 +816,16 @@ Transcripts default to `~/Documents/meetink/` because they're your data — they
 | `MEETINK_DIARIZE_THRESHOLD` | `0.65` | Cosine similarity required to claim a profile match. |
 | `MEETINK_DIARIZE_MARGIN` | `0.07` | Top profile match must beat runner-up by this. |
 | `MEETINK_DIARIZE_CLUSTER_THRESHOLD` | `0.72` | Cosine similarity required to join an existing cluster. |
+| `MEETINK_DIARIZE_SINGLE_FLOOR` | `0.78` | Absolute confidence floor when only ONE profile is whitelisted (or only one is enrolled). Higher than `THRESHOLD` because the MARGIN gate is meaningless in this case — runner-up cosine is `-1.0`, so any top score trivially "beats" it. Prevents the "single whitelist candidate always wins" failure mode. |
+| `MEETINK_DIARIZE_CLOSE_PAIR_THRESHOLD` | `0.80` | Cross-similarity between top and runner-up profiles above which "close-pair mode" engages — using `CLOSE_PAIR_MARGIN` (small) instead of the standard MARGIN for the gap requirement. Lower this to apply close-pair more aggressively; raise it to require larger gaps even between similar-voiced profiles. |
+| `MEETINK_DIARIZE_CLOSE_PAIR_MARGIN` | `0.03` | Margin gate when close-pair mode engages. Much smaller than standard MARGIN because, by definition, the two profiles can't be separated by much in WeSpeaker embedding space. The consistent direction of advantage carries the decision. |
 | `MEETINK_DIARIZE_PRESET` | `default` | Preset name read at server start (`focused` / `default` / `strict`). Hot-tunable via `/diarize sensitivity`. |
+| `MEETINK_DIARIZE_PROVIDER` | `cpu` | sherpa-onnx execution provider for the WeSpeaker model. Defaults to `cpu` because the CoreML provider has been unreliable for this model on recent macOS — every `compute()` call returns "Unable to compute the prediction" with no useful diagnostic. CPU inference is ~5–10 ms per 10 s window, so the perf trade is negligible. Set to `coreml` if you want to opt back in. |
 | `MEETINK_AUTO_TRAIN` | `true` | Enable folding high-confidence `/identify` matches back into matched profile. |
 | `MEETINK_AUTO_TRAIN_FLOOR` | `0.88` | Match cosine must clear this for auto-train to fire. |
 | `MEETINK_AUTO_TRAIN_MARGIN_MULT` | `2.0` | Top match must beat runner-up by ≥ N × the active MARGIN. |
 | `MEETINK_AUTO_TRAIN_MIN_SAMPLES` | `5` | Profile must already have this many samples before auto-train will add to it. |
+| `MEETINK_AUTO_TRAIN_TIGHTNESS_FLOOR` | `0.75` | Auto-train suspended for any profile whose tightness drops below this. Tightness = mean cosine of samples to their nearest centroid; low values indicate the centroid is being pulled apart by recent additions, so further auto-adds would accelerate drift. Manual `/profile train` still works to recover. |
 | `MEETINK_PROFILE_MAX_CENTROIDS` | `3` | Cap on k-means centroids per profile. Captures multimodal voice (different mics / moods / accents). Set to 1 to fall back to the old single-centroid representation. |
 | `MEETINK_PROFILE_SAMPLES_PER_CENTROID` | `10` | Threshold for adding another centroid. With defaults, profiles get K=1 until 10 samples, K=2 by 20, K=3 by 30, then capped. |
 | `MEETINK_PROFILE_OUTLIER_FLOOR` | `0.40` | Cosine ≥ this is required for a new sample to be accepted by `/enroll` / `/train` / `/assign` / `/rename` / auto-train. Rejected samples are reported back. Calibrated for 256-D WeSpeaker embeddings. |
